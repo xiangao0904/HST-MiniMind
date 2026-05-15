@@ -199,7 +199,7 @@ def method_to_mode(cfg: TrainConfig) -> str:
     }.get(cfg.method, cfg.superpose_mode)
 
 
-def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, max_batches: int = 2) -> float:
+def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, phase: str, max_batches: int = 2) -> float:
     model.eval()
     losses = []
     with torch.no_grad():
@@ -207,7 +207,6 @@ def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, ma
             if i >= max_batches:
                 break
             batch = batch.to(device)
-            phase = phase_for_step(cfg, cfg.max_steps)
             losses.append(compute_loss(model, composer, batch, cfg, phase).detach())
     model.train()
     return float(torch.stack(losses).mean().cpu())
@@ -295,7 +294,7 @@ def main() -> None:
 
         eval_loss = None
         if (step + 1) % cfg.eval_interval == 0 or step == 0:
-            eval_loss = evaluate(model, composer, eval_loader, cfg, device)
+            eval_loss = evaluate(model, composer, eval_loader, cfg, device, phase)
         if (step + 1) % cfg.save_interval == 0 or step + 1 == cfg.max_steps:
             save_checkpoint(ckpt_dir / f"step_{step + 1}.pt", model, optimizer, step + 1, cfg)
         record = {
