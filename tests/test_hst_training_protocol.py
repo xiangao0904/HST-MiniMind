@@ -3,7 +3,9 @@ import unittest
 try:
     import torch
 
-    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, token_counts, train_raw_seq_len
+    from pathlib import Path
+
+    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, phase_for_step, recovery_start_step, token_counts, train_raw_seq_len, tst_ratio
 except Exception:
     torch = None
 
@@ -30,6 +32,22 @@ class TrainingProtocolTest(unittest.TestCase):
         self.assertEqual(raw, 32)
         self.assertEqual(latent, 14)
         self.assertEqual(effective, 32)
+
+    def test_recovery_ratio_maps_to_paper_tst_ratio(self):
+        cfg = TrainConfig(method="vanilla_tst", max_steps=20000, recovery_ratio=0.7)
+        self.assertAlmostEqual(tst_ratio(cfg), 0.3)
+        self.assertEqual(recovery_start_step(cfg), 6000)
+        self.assertEqual(phase_for_step(cfg, 5999), "superposition")
+        self.assertEqual(phase_for_step(cfg, 6000), "recovery")
+
+    def test_ntp_baseline_has_zero_tst_ratio(self):
+        cfg = TrainConfig(method="ntp_baseline", max_steps=20000, recovery_ratio=0.7)
+        self.assertEqual(tst_ratio(cfg), 0.0)
+        self.assertEqual(recovery_start_step(cfg), 20000)
+
+    def test_checkpoint_step_sorts_numerically(self):
+        paths = [Path("step_5000.pt"), Path("step_10000.pt"), Path("step_50.pt")]
+        self.assertEqual([p.name for p in sorted(paths, key=checkpoint_step)], ["step_50.pt", "step_5000.pt", "step_10000.pt"])
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ class TrainConfig:
     output_dir: str = "./hst_runs/debug"
     max_steps: int = 3
     eval_interval: int = 1
+    online_eval_max_batches: int = 2
     save_interval: int = 100
     seed: int = 42
     superpose_size: int = 2
@@ -245,6 +246,8 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError(f"unknown method: {cfg.method}")
     if cfg.dry_run and cfg.max_steps > 20:
         raise ValueError("dry_run requires max_steps <= 20")
+    if cfg.online_eval_max_batches <= 0:
+        raise ValueError("online_eval_max_batches must be positive")
     if not 0.0 <= cfg.recovery_ratio <= 1.0:
         raise ValueError("recovery_ratio must be in [0, 1]")
     if cfg.tokenizer_backend not in {"char", "minimind"}:
@@ -255,10 +258,22 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("swanlab integration is not implemented")
 
 
+def tst_ratio(cfg: TrainConfig) -> float:
+    if cfg.method == "ntp_baseline":
+        return 0.0
+    return 1.0 - cfg.recovery_ratio
+
+
+def recovery_start_step(cfg: TrainConfig) -> int:
+    if cfg.method == "ntp_baseline":
+        return cfg.max_steps
+    return int(cfg.max_steps * tst_ratio(cfg))
+
+
 def phase_for_step(cfg: TrainConfig, step: int) -> str:
     if cfg.method == "ntp_baseline":
         return "ntp"
-    recovery_start = int(cfg.max_steps * (1.0 - cfg.recovery_ratio))
+    recovery_start = recovery_start_step(cfg)
     return "superposition" if step < recovery_start else "recovery"
 
 
@@ -325,8 +340,15 @@ def save_checkpoint(path: Path, model, optimizer, step: int, cfg: TrainConfig) -
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, "config": asdict(cfg)}, path)
 
 
+def checkpoint_step(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
 def load_latest_checkpoint(ckpt_dir: Path, model, optimizer) -> int:
-    checkpoints = sorted(ckpt_dir.glob("step_*.pt"))
+    checkpoints = sorted(ckpt_dir.glob("step_*.pt"), key=checkpoint_step)
     if not checkpoints:
         return 0
     data = torch.load(checkpoints[-1], map_location="cpu")
@@ -374,6 +396,7 @@ def init_wandb(cfg: TrainConfig, output_dir: Path):
             "method": cfg.method,
             "superpose_size": cfg.superpose_size,
             "recovery_ratio": cfg.recovery_ratio,
+            "tst_ratio": tst_ratio(cfg),
             "baseline_seq_len": baseline_seq_len(cfg),
             "paper_equal_flops": cfg.paper_equal_flops,
         }
@@ -472,8 +495,8 @@ def main() -> None:
         loss_eval_ntp = None
         loss_eval_phase = None
         if (step + 1) % cfg.eval_interval == 0 or step == 0:
-            loss_eval_ntp = evaluate(model, composer, eval_loader, cfg, device, "ntp")
-            loss_eval_phase = loss_eval_ntp if phase in {"ntp", "recovery"} else evaluate(model, composer, eval_loader, cfg, device, phase)
+            loss_eval_ntp = evaluate(model, composer, eval_loader, cfg, device, "ntp", cfg.online_eval_max_batches)
+            loss_eval_phase = loss_eval_ntp if phase in {"ntp", "recovery"} else evaluate(model, composer, eval_loader, cfg, device, phase, cfg.online_eval_max_batches)
         if (step + 1) % cfg.save_interval == 0 or step + 1 == cfg.max_steps:
             save_checkpoint(ckpt_dir / f"step_{step + 1}.pt", model, optimizer, step + 1, cfg)
         raw_step, latent_step, effective_step = token_counts(batch, cfg, phase)
@@ -498,6 +521,7 @@ def main() -> None:
             "effective_data_tokens_seen": effective_data_tokens_seen,
             "superpose_size": cfg.superpose_size,
             "recovery_ratio": cfg.recovery_ratio,
+            "tst_ratio": tst_ratio(cfg),
             "baseline_seq_len": baseline_seq_len(cfg),
             "raw_seq_len": batch.size(1),
             "paper_equal_flops": cfg.paper_equal_flops,

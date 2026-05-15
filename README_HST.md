@@ -2,16 +2,7 @@
 
 This repository contains an additive, isolated MVP for structure-aware Token Superposition Training experiments. The current project root did not include MiniMind source code, so the training entrypoint uses a small GPT-style causal LM while keeping the HST composer and loss interfaces separate for later MiniMind integration.
 
-## Git Note
 
-The execution platform exposes a read-only `.git` directory in the project root. Git metadata for this workspace is stored in `hst_git/`.
-
-Use:
-
-```bash
-git --git-dir=hst_git --work-tree=. status
-git --git-dir=hst_git --work-tree=. log --oneline
-```
 
 ## Local Verification
 
@@ -53,6 +44,23 @@ python3 scripts/hst_collect_metrics.py --runs_dir ./hst_runs --output_dir ./hst_
 ```
 
 This writes `summary.csv` and `summary.md` with final eval loss, best eval loss, recovery gap, and throughput estimates.
+
+For paper-style TST notation, `r` is the fraction of total steps spent in the superposition phase.
+The trainer keeps the older `recovery_ratio` field, so `tst_ratio = 1 - recovery_ratio` for TST runs.
+
+For stronger post-run checkpoint evaluation, use standard NTP offline eval:
+
+```bash
+python3 scripts/hst_offline_eval.py --run_dir ./hst_runs/P2_vanilla_tst_s4_r03_20k --device cuda --eval_max_batches 200
+```
+
+For recovery-specific analysis against a baseline run:
+
+```bash
+python3 scripts/hst_recovery_analysis.py \
+  --run_dir ./hst_runs/P2_vanilla_tst_s4_r03_20k \
+  --baseline_run_dir ./hst_runs/P0_ntp_baseline_20k
+```
 
 ## Probe Template
 

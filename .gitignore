@@ -12,9 +12,12 @@ hst_runs/
 hst_logs/
 hst_checkpoints/
 hst_outputs/*.jsonl
+hst_outputs/*.json
 hst_outputs/*.csv
 hst_outputs/summary.md
 hst_outputs/report.md
+hst_outputs/offline_eval_summary.md
+hst_outputs/recovery_analysis.md
 hst_tmp/
 dataset/
 
