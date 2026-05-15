@@ -65,7 +65,7 @@ def summarize(path: Path, threshold: float | None) -> dict:
     examples = rows[-1]["step"] if rows else 0
     return {
         "run": path.parent.name,
-        "method": rows[-1].get("method") if rows else "",
+        "method": rows[-1].get("experiment_method", rows[-1].get("method")) if rows else "",
         "tst_ratio": _tst_ratio(rows[-1]) if rows else None,
         "recovery_ratio": rows[-1].get("recovery_ratio") if rows else None,
         "final_eval_ntp_loss": final,

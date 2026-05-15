@@ -67,7 +67,7 @@ def analyze(rows: list[dict], baseline_rows: list[dict] | None = None) -> dict:
     after_loss = eval_value(first_after) if first_after is not None else None
     return {
         "run": rows[-1].get("run_name", "") if rows else "",
-        "method": rows[-1].get("method", "") if rows else "",
+        "method": rows[-1].get("experiment_method", rows[-1].get("method", "")) if rows else "",
         "recovery_start_step": switch_step,
         "last_ntp_eval_before_recovery": before_loss,
         "last_ntp_eval_before_recovery_step": last_before.get("step") if last_before else None,

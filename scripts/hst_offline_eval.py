@@ -37,6 +37,8 @@ from utils.hst_path_safety import ensure_within_project, safe_mkdir
 
 def latest_checkpoint(run_dir: Path) -> Path:
     checkpoints = sorted((run_dir / "checkpoints").glob("step_*.pt"), key=checkpoint_step)
+    if not checkpoints and (run_dir / "phase2_recovery").exists():
+        checkpoints = sorted((run_dir / "phase2_recovery" / "checkpoints").glob("step_*.pt"), key=checkpoint_step)
     if not checkpoints:
         raise FileNotFoundError(f"no checkpoints found under {run_dir / 'checkpoints'}")
     return checkpoints[-1]
@@ -82,7 +84,8 @@ def eval_checkpoint(checkpoint: Path, run_dir: Path | None, device_name: str, ev
         "run": run_dir.name if run_dir is not None else checkpoint.parent.parent.name,
         "checkpoint": str(checkpoint),
         "step": int(data.get("step", 0)),
-        "method": cfg.method,
+        "method": cfg.experiment_method or cfg.method,
+        "checkpoint_method": cfg.method,
         "loss_eval_ntp": loss,
         "eval_max_batches": eval_max_batches,
         "eval_batches": batches,

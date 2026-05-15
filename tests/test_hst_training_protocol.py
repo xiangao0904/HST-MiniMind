@@ -49,6 +49,16 @@ class TrainingProtocolTest(unittest.TestCase):
         paths = [Path("step_5000.pt"), Path("step_10000.pt"), Path("step_50.pt")]
         self.assertEqual([p.name for p in sorted(paths, key=checkpoint_step)], ["step_50.pt", "step_5000.pt", "step_10000.pt"])
 
+    def test_phase_override_for_paper_recovery(self):
+        cfg = TrainConfig(method="ntp_baseline", max_steps=14000, global_step_offset=6000, phase_override="recovery")
+        self.assertEqual(phase_for_step(cfg, 0), "recovery")
+        batch = torch.arange(32).view(2, 16)
+        self.assertEqual(batch_for_phase(batch, cfg, "recovery").shape, (2, 16))
+
+    def test_recovery_phase_uses_baseline_raw_len(self):
+        cfg = TrainConfig(method="vanilla_tst", baseline_seq_len=8, max_seq_len=8, superpose_size=4, paper_equal_flops=1, phase_override="recovery")
+        self.assertEqual(train_raw_seq_len(cfg), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

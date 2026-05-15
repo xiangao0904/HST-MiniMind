@@ -37,6 +37,28 @@ If `NPROC_PER_NODE` is set, the script uses `torchrun`; otherwise it uses `pytho
 hst_runs/{timestamp}_{run_name}/
 ```
 
+For stricter paper-style TST, use the two-phase launcher. It runs the superposition phase first,
+then starts a pure NTP recovery phase from the saved TST checkpoint:
+
+```bash
+python3 scripts/hst_paper_two_phase_train.py --config configs/hst/paper_vanilla_tst_s4_r03_20k.yaml
+```
+
+For full-data runs, build the packed cache once and then use the `*_full_20k.yaml` configs:
+
+```bash
+python3 scripts/hst_tokenize_dataset.py \
+  --input ./dataset/pretrain_t2t.jsonl \
+  --output ./hst_tmp/tokenized/pretrain_t2t_packed_seq3072.pt \
+  --tokenizer_path ./tokenizer/minimind_tokenizer \
+  --seq_len 3072 \
+  --pack_documents 1 \
+  --dtype int32
+
+python3 scripts/hst_remote_train.sh configs/hst/paper_ntp_baseline_full_20k.yaml
+python3 scripts/hst_paper_two_phase_train.py --config configs/hst/paper_vanilla_tst_s4_r03_full_20k.yaml
+```
+
 ## Metrics
 
 ```bash

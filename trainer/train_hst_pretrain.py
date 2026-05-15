@@ -39,10 +39,12 @@ METHODS = {"ntp_baseline", "vanilla_tst", "order_aware_tst", "boundary_aware_tst
 @dataclass
 class TrainConfig:
     method: str = "ntp_baseline"
+    experiment_method: str = ""
     data_path: str = "./hst_tmp/tiny_pretrain.jsonl"
     run_name: str = "debug"
     output_dir: str = "./hst_runs/debug"
     max_steps: int = 3
+    global_step_offset: int = 0
     eval_interval: int = 1
     online_eval_max_batches: int = 2
     save_interval: int = 100
@@ -78,6 +80,8 @@ class TrainConfig:
     num_layers: int = 2
     num_heads: int = 4
     dropout: float = 0.0
+    phase_override: str = ""
+    init_checkpoint_path: str = ""
 
 
 class CharTokenizer:
@@ -246,6 +250,8 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError(f"unknown method: {cfg.method}")
     if cfg.dry_run and cfg.max_steps > 20:
         raise ValueError("dry_run requires max_steps <= 20")
+    if cfg.global_step_offset < 0:
+        raise ValueError("global_step_offset must be non-negative")
     if cfg.online_eval_max_batches <= 0:
         raise ValueError("online_eval_max_batches must be positive")
     if not 0.0 <= cfg.recovery_ratio <= 1.0:
@@ -254,6 +260,10 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("tokenizer_backend must be char or minimind")
     if cfg.use_tokenized_cache and not cfg.tokenized_cache_path:
         raise ValueError("use_tokenized_cache requires tokenized_cache_path")
+    if cfg.phase_override not in {"", "ntp", "superposition", "recovery"}:
+        raise ValueError("phase_override must be empty, ntp, superposition, or recovery")
+    if cfg.phase_override == "superposition" and cfg.method == "ntp_baseline":
+        raise ValueError("phase_override=superposition requires a TST method")
     if cfg.use_swanlab:
         raise ValueError("swanlab integration is not implemented")
 
@@ -271,6 +281,8 @@ def recovery_start_step(cfg: TrainConfig) -> int:
 
 
 def phase_for_step(cfg: TrainConfig, step: int) -> str:
+    if cfg.phase_override:
+        return cfg.phase_override
     if cfg.method == "ntp_baseline":
         return "ntp"
     recovery_start = recovery_start_step(cfg)
@@ -291,6 +303,8 @@ def baseline_seq_len(cfg: TrainConfig) -> int:
 
 
 def train_raw_seq_len(cfg: TrainConfig) -> int:
+    if cfg.phase_override in {"ntp", "recovery"}:
+        return baseline_seq_len(cfg)
     if cfg.paper_equal_flops and cfg.method != "ntp_baseline":
         return baseline_seq_len(cfg) * cfg.superpose_size
     return cfg.max_seq_len
@@ -328,6 +342,8 @@ def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, ph
 def compute_loss(model, composer, batch: torch.Tensor, cfg: TrainConfig, phase: str) -> torch.Tensor:
     if phase in {"ntp", "recovery"}:
         return ntp_loss(model(input_ids=batch)["logits"], batch)
+    if composer is None:
+        raise ValueError("superposition phase requires a composer")
     composed = composer.compose(batch)
     out = model(inputs_embeds=composed["inputs_embeds"])
     if cfg.loss_mode == "ordered_slot":
@@ -335,9 +351,19 @@ def compute_loss(model, composer, batch: torch.Tensor, cfg: TrainConfig, phase: 
     return repeated_token_ce_loss(out["logits"], composed["chunk_targets"])
 
 
-def save_checkpoint(path: Path, model, optimizer, step: int, cfg: TrainConfig) -> None:
+def save_checkpoint(path: Path, model, optimizer, step: int, cfg: TrainConfig, local_step: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, "config": asdict(cfg)}, path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "local_step": local_step if local_step is not None else step,
+            "global_step_offset": cfg.global_step_offset,
+            "config": asdict(cfg),
+        },
+        path,
+    )
 
 
 def checkpoint_step(path: Path) -> int:
@@ -354,6 +380,12 @@ def load_latest_checkpoint(ckpt_dir: Path, model, optimizer) -> int:
     data = torch.load(checkpoints[-1], map_location="cpu")
     model.load_state_dict(data["model"])
     optimizer.load_state_dict(data["optimizer"])
+    return int(data.get("local_step", data.get("step", 0)))
+
+
+def load_model_checkpoint(path: Path, model) -> int:
+    data = torch.load(path, map_location="cpu")
+    model.load_state_dict(data["model"])
     return int(data.get("step", 0))
 
 
@@ -394,6 +426,7 @@ def init_wandb(cfg: TrainConfig, output_dir: Path):
         {
             "run_name": cfg.run_name,
             "method": cfg.method,
+            "experiment_method": cfg.experiment_method or cfg.method,
             "superpose_size": cfg.superpose_size,
             "recovery_ratio": cfg.recovery_ratio,
             "tst_ratio": tst_ratio(cfg),
@@ -424,6 +457,7 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     data_path = ensure_within_project(cfg.data_path)
     output_dir = ensure_run_output_dir(cfg.output_dir)
+    init_checkpoint_path = ensure_within_project(cfg.init_checkpoint_path) if cfg.init_checkpoint_path else None
     safe_mkdir(output_dir)
     ckpt_dir = safe_mkdir(output_dir / "checkpoints")
     safe_mkdir(output_dir / "outputs")
@@ -452,22 +486,26 @@ def main() -> None:
     model = TinyCausalLM(vocab_size, baseline_seq_len(cfg), cfg.hidden_size, cfg.num_layers, cfg.num_heads, cfg.dropout).to(device)
     if not id_to_text:
         id_to_text = {i: "" for i in range(vocab_size)}
-    token_types = torch.tensor(build_token_type_cache(id_to_text, output_dir / "token_type_cache.json"), dtype=torch.long, device=device)
-    sp_cfg = SuperpositionConfig(
-        mode=method_to_mode(cfg),
-        superpose_size=cfg.superpose_size,
-        hidden_size=cfg.hidden_size,
-        vocab_size=vocab_size,
-        slot_gate_type=cfg.slot_gate_type,
-        type_vocab_size=cfg.type_vocab_size,
-        block_mode=cfg.block_mode,
-        chunks_per_block=cfg.chunks_per_block,
-        hier_alpha=cfg.hier_alpha,
-    )
-    composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
+    composer = None
+    if cfg.method != "ntp_baseline" and cfg.phase_override not in {"ntp", "recovery"}:
+        token_types = torch.tensor(build_token_type_cache(id_to_text, output_dir / "token_type_cache.json"), dtype=torch.long, device=device)
+        sp_cfg = SuperpositionConfig(
+            mode=method_to_mode(cfg),
+            superpose_size=cfg.superpose_size,
+            hidden_size=cfg.hidden_size,
+            vocab_size=vocab_size,
+            slot_gate_type=cfg.slot_gate_type,
+            type_vocab_size=cfg.type_vocab_size,
+            block_mode=cfg.block_mode,
+            chunks_per_block=cfg.chunks_per_block,
+            hier_alpha=cfg.hier_alpha,
+        )
+        composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
     model_param_ids = {id(p) for p in model.parameters()}
-    composer_params = [p for p in composer.parameters() if id(p) not in model_param_ids]
+    composer_params = [p for p in composer.parameters() if id(p) not in model_param_ids] if composer is not None else []
     optimizer = torch.optim.AdamW(list(model.parameters()) + composer_params, lr=cfg.learning_rate)
+    if init_checkpoint_path is not None and not cfg.from_resume:
+        load_model_checkpoint(init_checkpoint_path, model)
     start_step = load_latest_checkpoint(ckpt_dir, model, optimizer) if cfg.from_resume else 0
     metrics_path = output_dir / cfg.log_jsonl
     start_time = time.time()
@@ -483,6 +521,7 @@ def main() -> None:
         except StopIteration:
             data_iter = iter(loader)
             batch = next(data_iter)
+        global_step = cfg.global_step_offset + step + 1
         phase = phase_for_step(cfg, step)
         batch = batch_for_phase(batch.to(device), cfg, phase)
         optimizer.zero_grad(set_to_none=True)
@@ -494,11 +533,11 @@ def main() -> None:
 
         loss_eval_ntp = None
         loss_eval_phase = None
-        if (step + 1) % cfg.eval_interval == 0 or step == 0:
+        if global_step % cfg.eval_interval == 0 or step == 0:
             loss_eval_ntp = evaluate(model, composer, eval_loader, cfg, device, "ntp", cfg.online_eval_max_batches)
             loss_eval_phase = loss_eval_ntp if phase in {"ntp", "recovery"} else evaluate(model, composer, eval_loader, cfg, device, phase, cfg.online_eval_max_batches)
         if (step + 1) % cfg.save_interval == 0 or step + 1 == cfg.max_steps:
-            save_checkpoint(ckpt_dir / f"step_{step + 1}.pt", model, optimizer, step + 1, cfg)
+            save_checkpoint(ckpt_dir / f"step_{global_step}.pt", model, optimizer, global_step, cfg, local_step=step + 1)
         raw_step, latent_step, effective_step = token_counts(batch, cfg, phase)
         raw_tokens_seen += raw_step
         latent_tokens_seen += latent_step
@@ -507,7 +546,10 @@ def main() -> None:
             "time": datetime.now(timezone.utc).isoformat(),
             "run_name": cfg.run_name,
             "method": cfg.method,
-            "step": step + 1,
+            "experiment_method": cfg.experiment_method or cfg.method,
+            "step": global_step,
+            "local_step": step + 1,
+            "global_step_offset": cfg.global_step_offset,
             "phase": phase,
             "loss_train": float(loss.detach().cpu()),
             "loss_eval": loss_eval_ntp,
@@ -531,7 +573,7 @@ def main() -> None:
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         if wandb_run is not None:
-            wandb_run.log(build_wandb_record(record), step=step + 1)
+            wandb_run.log(build_wandb_record(record), step=global_step)
         print(json.dumps(record, ensure_ascii=False))
 
     shutil.copy2(metrics_path, output_dir / "outputs" / "metrics.jsonl")
