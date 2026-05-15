@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import shutil
 import sys
@@ -52,10 +53,16 @@ class TrainConfig:
     learning_rate: float = 3e-4
     batch_size: int = 2
     max_seq_len: int = 128
+    baseline_seq_len: int = 0
+    paper_equal_flops: int = 0
     device: str = "cpu"
     dry_run: int = 0
     debug: int = 0
     from_resume: int = 0
+    tokenizer_backend: str = "char"
+    tokenizer_path: str = "./tokenizer/minimind_tokenizer"
+    use_tokenized_cache: int = 0
+    tokenized_cache_path: str = ""
     block_mode: str = "fixed"
     chunks_per_block: int = 8
     hier_alpha: float = 0.1
@@ -63,6 +70,8 @@ class TrainConfig:
     type_vocab_size: int = 11
     log_jsonl: str = "metrics.jsonl"
     use_wandb: int = 0
+    wandb_project: str = "hst-minimind"
+    wandb_entity: str = ""
     use_swanlab: int = 0
     hidden_size: int = 128
     num_layers: int = 2
@@ -93,6 +102,42 @@ class CharTokenizer:
         return ids
 
 
+class MiniMindTokenizer:
+    def __init__(self, tokenizer_path: Path) -> None:
+        try:
+            from tokenizers import Tokenizer
+        except Exception as exc:
+            raise RuntimeError("tokenizer_backend=minimind requires the tokenizers package") from exc
+        path = tokenizer_path / "tokenizer.json" if tokenizer_path.is_dir() else tokenizer_path
+        self.tokenizer = Tokenizer.from_file(str(path))
+        self.pad_token_id = self._first_token_id(["<pad>", "[PAD]", "<unk>", "<eos>"], default=0)
+        self.eos_token_id = self._first_token_id(["<eos>", "</s>", "<|endoftext|>"], default=None)
+        self.id_to_text = {
+            token_id: (self.tokenizer.id_to_token(token_id) or "")
+            for token_id in range(self.tokenizer.get_vocab_size())
+        }
+
+    def _first_token_id(self, candidates: list[str], default: int | None) -> int | None:
+        for token in candidates:
+            token_id = self.tokenizer.token_to_id(token)
+            if token_id is not None:
+                return int(token_id)
+        return default
+
+    @property
+    def vocab_size(self) -> int:
+        return self.tokenizer.get_vocab_size()
+
+    def encode(self, text: str, max_len: int) -> list[int]:
+        ids = self.tokenizer.encode(text).ids
+        if self.eos_token_id is not None:
+            ids.append(self.eos_token_id)
+        ids = ids[:max_len]
+        if len(ids) < max_len:
+            ids.extend([int(self.pad_token_id)] * (max_len - len(ids)))
+        return ids
+
+
 class JsonlTextDataset(Dataset):
     def __init__(self, path: Path, tokenizer: CharTokenizer, max_seq_len: int) -> None:
         self.rows = load_texts(path)
@@ -104,6 +149,29 @@ class JsonlTextDataset(Dataset):
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         return torch.tensor(self.tokenizer.encode(self.rows[idx], self.max_seq_len), dtype=torch.long)
+
+
+class TokenizedTensorDataset(Dataset):
+    def __init__(self, path: Path, max_seq_len: int) -> None:
+        data = torch.load(path, map_location="cpu")
+        if isinstance(data, dict):
+            self.input_ids = data["input_ids"]
+            self.vocab_size = int(data["vocab_size"])
+            raw_id_to_text = data.get("id_to_text") or []
+            self.id_to_text = {i: str(text) for i, text in enumerate(raw_id_to_text)}
+        else:
+            self.input_ids = data
+            self.vocab_size = int(self.input_ids.max().item()) + 1
+            self.id_to_text = {}
+        if self.input_ids.size(1) < max_seq_len:
+            raise ValueError(f"tokenized cache seq_len {self.input_ids.size(1)} is smaller than required {max_seq_len}")
+        self.max_seq_len = max_seq_len
+
+    def __len__(self) -> int:
+        return self.input_ids.size(0)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self.input_ids[idx, : self.max_seq_len].long()
 
 
 class TinyCausalLM(nn.Module):
@@ -179,8 +247,12 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("dry_run requires max_steps <= 20")
     if not 0.0 <= cfg.recovery_ratio <= 1.0:
         raise ValueError("recovery_ratio must be in [0, 1]")
-    if cfg.use_wandb or cfg.use_swanlab:
-        raise ValueError("wandb/swanlab integration is intentionally disabled in this MVP")
+    if cfg.tokenizer_backend not in {"char", "minimind"}:
+        raise ValueError("tokenizer_backend must be char or minimind")
+    if cfg.use_tokenized_cache and not cfg.tokenized_cache_path:
+        raise ValueError("use_tokenized_cache requires tokenized_cache_path")
+    if cfg.use_swanlab:
+        raise ValueError("swanlab integration is not implemented")
 
 
 def phase_for_step(cfg: TrainConfig, step: int) -> str:
@@ -199,6 +271,32 @@ def method_to_mode(cfg: TrainConfig) -> str:
     }.get(cfg.method, cfg.superpose_mode)
 
 
+def baseline_seq_len(cfg: TrainConfig) -> int:
+    return cfg.baseline_seq_len or cfg.max_seq_len
+
+
+def train_raw_seq_len(cfg: TrainConfig) -> int:
+    if cfg.paper_equal_flops and cfg.method != "ntp_baseline":
+        return baseline_seq_len(cfg) * cfg.superpose_size
+    return cfg.max_seq_len
+
+
+def batch_for_phase(batch: torch.Tensor, cfg: TrainConfig, phase: str) -> torch.Tensor:
+    if phase in {"ntp", "recovery"}:
+        return batch[:, : baseline_seq_len(cfg)]
+    return batch[:, : train_raw_seq_len(cfg)]
+
+
+def token_counts(batch: torch.Tensor, cfg: TrainConfig, phase: str) -> tuple[int, int, int]:
+    bsz, seq_len = batch.shape
+    raw_tokens = bsz * seq_len
+    if phase in {"ntp", "recovery"}:
+        return raw_tokens, raw_tokens, raw_tokens
+    usable_len = (seq_len // cfg.superpose_size) * cfg.superpose_size
+    latent_tokens = bsz * max(0, (usable_len // cfg.superpose_size) - 1)
+    return raw_tokens, latent_tokens, bsz * usable_len
+
+
 def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, phase: str, max_batches: int = 2) -> float:
     model.eval()
     losses = []
@@ -206,7 +304,7 @@ def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, ph
         for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
-            batch = batch.to(device)
+            batch = batch_for_phase(batch.to(device), cfg, phase)
             losses.append(compute_loss(model, composer, batch, cfg, phase).detach())
     model.train()
     return float(torch.stack(losses).mean().cpu())
@@ -237,6 +335,66 @@ def load_latest_checkpoint(ckpt_dir: Path, model, optimizer) -> int:
     return int(data.get("step", 0))
 
 
+def init_wandb(cfg: TrainConfig, output_dir: Path):
+    if not cfg.use_wandb:
+        return None
+    wandb_root = safe_mkdir(output_dir / "artifacts" / "wandb")
+    os.environ.setdefault("WANDB_DIR", str(wandb_root))
+    os.environ.setdefault("WANDB_CACHE_DIR", str(wandb_root / "cache"))
+    os.environ.setdefault("WANDB_CONFIG_DIR", str(wandb_root / "config"))
+    safe_mkdir(os.environ["WANDB_CACHE_DIR"])
+    safe_mkdir(os.environ["WANDB_CONFIG_DIR"])
+    try:
+        import wandb
+    except Exception as exc:
+        raise RuntimeError("use_wandb=1 requires the wandb package in the active environment") from exc
+    init_kwargs = {
+        "project": cfg.wandb_project,
+        "name": cfg.run_name,
+        "dir": str(wandb_root),
+        "config": asdict(cfg),
+    }
+    if cfg.wandb_entity:
+        init_kwargs["entity"] = cfg.wandb_entity
+    run = wandb.init(**init_kwargs)
+    wandb.define_metric("step")
+    for metric in (
+        "loss_train",
+        "loss_eval_ntp",
+        "loss_eval_phase",
+        "lr",
+        "raw_tokens_seen",
+        "effective_data_tokens_seen",
+        "gpu_mem_gb",
+    ):
+        wandb.define_metric(metric, step_metric="step")
+    run.summary.update(
+        {
+            "run_name": cfg.run_name,
+            "method": cfg.method,
+            "superpose_size": cfg.superpose_size,
+            "recovery_ratio": cfg.recovery_ratio,
+            "baseline_seq_len": baseline_seq_len(cfg),
+            "paper_equal_flops": cfg.paper_equal_flops,
+        }
+    )
+    return run
+
+
+def build_wandb_record(record: dict) -> dict:
+    keys = (
+        "step",
+        "loss_train",
+        "loss_eval_ntp",
+        "loss_eval_phase",
+        "lr",
+        "raw_tokens_seen",
+        "effective_data_tokens_seen",
+        "gpu_mem_gb",
+    )
+    return {key: record[key] for key in keys if record.get(key) is not None}
+
+
 def main() -> None:
     cfg = parse_args()
     random.seed(cfg.seed)
@@ -246,28 +404,44 @@ def main() -> None:
     safe_mkdir(output_dir)
     ckpt_dir = safe_mkdir(output_dir / "checkpoints")
     safe_mkdir(output_dir / "outputs")
+    safe_mkdir(output_dir / "artifacts")
     (output_dir / "config.yaml").write_text(yaml.safe_dump(asdict(cfg), sort_keys=True), encoding="utf-8")
+    wandb_run = init_wandb(cfg, output_dir)
 
-    texts = load_texts(data_path)
-    tokenizer = CharTokenizer(texts)
-    dataset = JsonlTextDataset(data_path, tokenizer, cfg.max_seq_len)
+    dataset_seq_len = train_raw_seq_len(cfg)
+    if cfg.use_tokenized_cache:
+        dataset = TokenizedTensorDataset(ensure_within_project(cfg.tokenized_cache_path), dataset_seq_len)
+        tokenizer = None
+        vocab_size = dataset.vocab_size
+        id_to_text = dataset.id_to_text
+    else:
+        texts = load_texts(data_path)
+        if cfg.tokenizer_backend == "minimind":
+            tokenizer = MiniMindTokenizer(ensure_within_project(cfg.tokenizer_path))
+        else:
+            tokenizer = CharTokenizer(texts)
+        dataset = JsonlTextDataset(data_path, tokenizer, dataset_seq_len)
+        vocab_size = tokenizer.vocab_size
+        id_to_text = tokenizer.id_to_text
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, drop_last=True)
     device = torch.device(cfg.device)
-    model = TinyCausalLM(tokenizer.vocab_size, cfg.max_seq_len, cfg.hidden_size, cfg.num_layers, cfg.num_heads, cfg.dropout).to(device)
-    token_types = torch.tensor(build_token_type_cache(tokenizer.id_to_text, output_dir / "token_type_cache.json"), dtype=torch.long, device=device)
+    model = TinyCausalLM(vocab_size, baseline_seq_len(cfg), cfg.hidden_size, cfg.num_layers, cfg.num_heads, cfg.dropout).to(device)
+    if not id_to_text:
+        id_to_text = {i: "" for i in range(vocab_size)}
+    token_types = torch.tensor(build_token_type_cache(id_to_text, output_dir / "token_type_cache.json"), dtype=torch.long, device=device)
     sp_cfg = SuperpositionConfig(
         mode=method_to_mode(cfg),
         superpose_size=cfg.superpose_size,
         hidden_size=cfg.hidden_size,
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=vocab_size,
         slot_gate_type=cfg.slot_gate_type,
         type_vocab_size=cfg.type_vocab_size,
         block_mode=cfg.block_mode,
         chunks_per_block=cfg.chunks_per_block,
         hier_alpha=cfg.hier_alpha,
     )
-    composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, tokenizer.vocab_size, sp_cfg, token_types).to(device)
+    composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
     model_param_ids = {id(p) for p in model.parameters()}
     composer_params = [p for p in composer.parameters() if id(p) not in model_param_ids]
     optimizer = torch.optim.AdamW(list(model.parameters()) + composer_params, lr=cfg.learning_rate)
@@ -275,6 +449,9 @@ def main() -> None:
     metrics_path = output_dir / cfg.log_jsonl
     start_time = time.time()
     data_iter = iter(loader)
+    raw_tokens_seen = start_step * cfg.batch_size * dataset_seq_len
+    latent_tokens_seen = start_step * cfg.batch_size * baseline_seq_len(cfg)
+    effective_data_tokens_seen = raw_tokens_seen
 
     print(yaml.safe_dump(asdict(cfg), sort_keys=True))
     for step in range(start_step, cfg.max_steps):
@@ -283,8 +460,8 @@ def main() -> None:
         except StopIteration:
             data_iter = iter(loader)
             batch = next(data_iter)
-        batch = batch.to(device)
         phase = phase_for_step(cfg, step)
+        batch = batch_for_phase(batch.to(device), cfg, phase)
         optimizer.zero_grad(set_to_none=True)
         loss = compute_loss(model, composer, batch, cfg, phase)
         if not torch.isfinite(loss):
@@ -292,11 +469,17 @@ def main() -> None:
         loss.backward()
         optimizer.step()
 
-        eval_loss = None
+        loss_eval_ntp = None
+        loss_eval_phase = None
         if (step + 1) % cfg.eval_interval == 0 or step == 0:
-            eval_loss = evaluate(model, composer, eval_loader, cfg, device, phase)
+            loss_eval_ntp = evaluate(model, composer, eval_loader, cfg, device, "ntp")
+            loss_eval_phase = loss_eval_ntp if phase in {"ntp", "recovery"} else evaluate(model, composer, eval_loader, cfg, device, phase)
         if (step + 1) % cfg.save_interval == 0 or step + 1 == cfg.max_steps:
             save_checkpoint(ckpt_dir / f"step_{step + 1}.pt", model, optimizer, step + 1, cfg)
+        raw_step, latent_step, effective_step = token_counts(batch, cfg, phase)
+        raw_tokens_seen += raw_step
+        latent_tokens_seen += latent_step
+        effective_data_tokens_seen += effective_step
         record = {
             "time": datetime.now(timezone.utc).isoformat(),
             "run_name": cfg.run_name,
@@ -304,20 +487,32 @@ def main() -> None:
             "step": step + 1,
             "phase": phase,
             "loss_train": float(loss.detach().cpu()),
-            "loss_eval": eval_loss,
+            "loss_eval": loss_eval_ntp,
+            "loss_eval_ntp": loss_eval_ntp,
+            "loss_eval_phase": loss_eval_phase,
             "lr": optimizer.param_groups[0]["lr"],
-            "tokens_seen": (step + 1) * cfg.batch_size * cfg.max_seq_len,
-            "effective_tokens_seen": (step + 1) * cfg.batch_size * cfg.max_seq_len / max(1, cfg.superpose_size),
+            "tokens_seen": raw_tokens_seen,
+            "raw_tokens_seen": raw_tokens_seen,
+            "latent_tokens_seen": latent_tokens_seen,
+            "effective_tokens_seen": effective_data_tokens_seen,
+            "effective_data_tokens_seen": effective_data_tokens_seen,
             "superpose_size": cfg.superpose_size,
             "recovery_ratio": cfg.recovery_ratio,
+            "baseline_seq_len": baseline_seq_len(cfg),
+            "raw_seq_len": batch.size(1),
+            "paper_equal_flops": cfg.paper_equal_flops,
             "wall_time_sec": time.time() - start_time,
             "gpu_mem_gb": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0,
         }
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if wandb_run is not None:
+            wandb_run.log(build_wandb_record(record), step=step + 1)
         print(json.dumps(record, ensure_ascii=False))
 
     shutil.copy2(metrics_path, output_dir / "outputs" / "metrics.jsonl")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
