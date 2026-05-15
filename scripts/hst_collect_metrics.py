@@ -24,38 +24,45 @@ def load_metrics(path: Path) -> list[dict]:
     return rows
 
 
+def _eval_value(row: dict) -> float | None:
+    return row.get("loss_eval_ntp", row.get("loss_eval"))
+
+
 def recovery_gap(rows: list[dict]) -> float | None:
     last_super = None
     for row in rows:
-        if row.get("phase") == "superposition" and row.get("loss_eval") is not None:
-            last_super = row["loss_eval"]
-        if row.get("phase") == "recovery" and row.get("loss_eval") is not None and last_super is not None:
-            return row["loss_eval"] - last_super
+        eval_loss = _eval_value(row)
+        if row.get("phase") == "superposition" and eval_loss is not None:
+            last_super = eval_loss
+        if row.get("phase") == "recovery" and eval_loss is not None and last_super is not None:
+            return eval_loss - last_super
     return None
 
 
 def summarize(path: Path, threshold: float | None) -> dict:
     rows = load_metrics(path)
-    evals = [r for r in rows if r.get("loss_eval") is not None]
-    final = evals[-1]["loss_eval"] if evals else None
-    best = min((r["loss_eval"] for r in evals), default=None)
+    evals = [r for r in rows if _eval_value(r) is not None]
+    final = _eval_value(evals[-1]) if evals else None
+    best = min((_eval_value(r) for r in evals), default=None)
     time_to = None
     if threshold is not None:
         for row in evals:
-            if row["loss_eval"] <= threshold:
+            if _eval_value(row) <= threshold:
                 time_to = row["wall_time_sec"]
                 break
     elapsed = rows[-1]["wall_time_sec"] if rows else 0.0
-    tokens = rows[-1]["tokens_seen"] if rows else 0
+    tokens = rows[-1].get("raw_tokens_seen", rows[-1].get("tokens_seen", 0)) if rows else 0
+    data_tokens = rows[-1].get("effective_data_tokens_seen", rows[-1].get("effective_tokens_seen", 0)) if rows else 0
     examples = rows[-1]["step"] if rows else 0
     return {
         "run": path.parent.name,
         "method": rows[-1].get("method") if rows else "",
-        "final_eval_loss": final,
-        "best_eval_loss": best,
+        "final_eval_ntp_loss": final,
+        "best_eval_ntp_loss": best,
         "time_to_loss": time_to,
-        "recovery_gap": recovery_gap(rows),
-        "tokens_per_sec": tokens / elapsed if elapsed else None,
+        "recovery_gap_ntp": recovery_gap(rows),
+        "raw_tokens_per_sec": tokens / elapsed if elapsed else None,
+        "data_tokens_per_sec": data_tokens / elapsed if elapsed else None,
         "steps_per_sec": examples / elapsed if elapsed else None,
         "metrics_path": str(path),
     }
@@ -70,20 +77,20 @@ def main() -> None:
 
     runs_dir = ensure_within_project(args.runs_dir)
     out_dir = safe_mkdir(args.output_dir)
-    metrics = sorted(runs_dir.glob("**/metrics.jsonl"))
+    metrics = sorted(runs_dir.glob("*/metrics.jsonl"))
     rows = [summarize(path, args.threshold) for path in metrics]
     csv_path = out_dir / "summary.csv"
     md_path = out_dir / "summary.md"
-    fieldnames = ["run", "method", "final_eval_loss", "best_eval_loss", "time_to_loss", "recovery_gap", "tokens_per_sec", "steps_per_sec", "metrics_path"]
+    fieldnames = ["run", "method", "final_eval_ntp_loss", "best_eval_ntp_loss", "time_to_loss", "recovery_gap_ntp", "raw_tokens_per_sec", "data_tokens_per_sec", "steps_per_sec", "metrics_path"]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
     with md_path.open("w", encoding="utf-8") as f:
-        f.write("| Run | Method | Final Eval Loss | Best Eval Loss | Recovery Gap |\n")
+        f.write("| Run | Method | Final NTP Eval Loss | Best NTP Eval Loss | Recovery Gap NTP |\n")
         f.write("| --- | --- | ---: | ---: | ---: |\n")
         for row in rows:
-            f.write(f"| {row['run']} | {row['method']} | {row['final_eval_loss']} | {row['best_eval_loss']} | {row['recovery_gap']} |\n")
+            f.write(f"| {row['run']} | {row['method']} | {row['final_eval_ntp_loss']} | {row['best_eval_ntp_loss']} | {row['recovery_gap_ntp']} |\n")
     print(f"wrote {csv_path} and {md_path}")
 
 
