@@ -1,0 +1,14 @@
+method: ntp_baseline
+run_name: debug_ntp_baseline
+output_dir: ./hst_runs/debug_ntp_baseline
+data_path: ./hst_tmp/tiny_pretrain.jsonl
+max_steps: 3
+eval_interval: 1
+save_interval: 100
+batch_size: 2
+max_seq_len: 64
+learning_rate: 0.0003
+seed: 42
+dry_run: 1
+debug: 1
+device: cpu

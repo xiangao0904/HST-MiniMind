@@ -1,0 +1,17 @@
+method: boundary_aware_tst
+run_name: debug_boundary_s2
+output_dir: ./hst_runs/debug_boundary_s2
+data_path: ./hst_tmp/tiny_pretrain.jsonl
+max_steps: 3
+eval_interval: 1
+save_interval: 100
+batch_size: 2
+max_seq_len: 64
+learning_rate: 0.0003
+seed: 42
+superpose_size: 2
+loss_mode: repeated_ce
+recovery_ratio: 0.34
+dry_run: 1
+debug: 1
+device: cpu
