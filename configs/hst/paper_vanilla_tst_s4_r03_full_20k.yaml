@@ -8,6 +8,8 @@ use_tokenized_cache: 1
 tokenized_cache_path: ./hst_tmp/tokenized/pretrain_t2t_packed_seq3072.pt
 max_steps: 20000
 eval_interval: 500
+dense_eval_interval: 50
+dense_eval_window: 500
 online_eval_max_batches: 2
 save_interval: 5000
 batch_size: 16

@@ -76,6 +76,10 @@ For stronger post-run checkpoint evaluation, use standard NTP offline eval:
 python3 scripts/hst_offline_eval.py --run_dir ./hst_runs/P2_vanilla_tst_s4_r03_20k --device cuda --eval_max_batches 200
 ```
 
+To inspect the recovery drop more clearly, the full-data paper configs now support denser online
+NTP eval around the recovery switch. The default full configs keep `eval_interval: 500`, and also
+add a dense window of `+-500` steps with eval every `50` steps near the recovery anchor.
+
 For recovery-specific analysis against a baseline run:
 
 ```bash

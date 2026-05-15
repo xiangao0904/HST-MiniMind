@@ -5,7 +5,7 @@ try:
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, phase_for_step, recovery_start_step, token_counts, train_raw_seq_len, tst_ratio
+    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio
 except Exception:
     torch = None
 
@@ -58,6 +58,20 @@ class TrainingProtocolTest(unittest.TestCase):
     def test_recovery_phase_uses_baseline_raw_len(self):
         cfg = TrainConfig(method="vanilla_tst", baseline_seq_len=8, max_seq_len=8, superpose_size=4, paper_equal_flops=1, phase_override="recovery")
         self.assertEqual(train_raw_seq_len(cfg), 8)
+
+    def test_dense_eval_anchor_defaults_to_recovery_start(self):
+        cfg = TrainConfig(method="vanilla_tst", max_steps=20000, recovery_ratio=0.7)
+        self.assertEqual(dense_eval_anchor_step(cfg), 6001)
+
+    def test_dense_eval_anchor_for_two_phase_recovery(self):
+        cfg = TrainConfig(method="ntp_baseline", phase_override="recovery", global_step_offset=6000, max_steps=14000)
+        self.assertEqual(dense_eval_anchor_step(cfg), 6001)
+
+    def test_should_run_dense_eval_near_anchor(self):
+        cfg = TrainConfig(method="vanilla_tst", max_steps=20000, recovery_ratio=0.7, eval_interval=500, dense_eval_interval=50, dense_eval_window=100)
+        self.assertTrue(should_run_eval(cfg, step=5949, global_step=5950))
+        self.assertTrue(should_run_eval(cfg, step=6000, global_step=6001))
+        self.assertFalse(should_run_eval(cfg, step=5900, global_step=5901))
 
 
 if __name__ == "__main__":

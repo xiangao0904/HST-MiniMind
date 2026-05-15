@@ -46,6 +46,9 @@ class TrainConfig:
     max_steps: int = 3
     global_step_offset: int = 0
     eval_interval: int = 1
+    dense_eval_interval: int = 0
+    dense_eval_window: int = 0
+    dense_eval_anchor_step: int = 0
     online_eval_max_batches: int = 2
     save_interval: int = 100
     seed: int = 42
@@ -252,6 +255,14 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("dry_run requires max_steps <= 20")
     if cfg.global_step_offset < 0:
         raise ValueError("global_step_offset must be non-negative")
+    if cfg.dense_eval_interval < 0:
+        raise ValueError("dense_eval_interval must be non-negative")
+    if cfg.dense_eval_window < 0:
+        raise ValueError("dense_eval_window must be non-negative")
+    if cfg.dense_eval_anchor_step < 0:
+        raise ValueError("dense_eval_anchor_step must be non-negative")
+    if cfg.dense_eval_window > 0 and cfg.dense_eval_interval <= 0:
+        raise ValueError("dense_eval_window requires dense_eval_interval > 0")
     if cfg.online_eval_max_batches <= 0:
         raise ValueError("online_eval_max_batches must be positive")
     if not 0.0 <= cfg.recovery_ratio <= 1.0:
@@ -287,6 +298,29 @@ def phase_for_step(cfg: TrainConfig, step: int) -> str:
         return "ntp"
     recovery_start = recovery_start_step(cfg)
     return "superposition" if step < recovery_start else "recovery"
+
+
+def dense_eval_anchor_step(cfg: TrainConfig) -> int | None:
+    if cfg.dense_eval_anchor_step > 0:
+        return cfg.dense_eval_anchor_step
+    if cfg.phase_override == "recovery":
+        return cfg.global_step_offset + 1
+    if cfg.phase_override == "superposition":
+        return cfg.global_step_offset + cfg.max_steps + 1
+    if cfg.method == "ntp_baseline":
+        return None
+    return recovery_start_step(cfg) + 1
+
+
+def should_run_eval(cfg: TrainConfig, step: int, global_step: int) -> bool:
+    if global_step % cfg.eval_interval == 0 or step == 0:
+        return True
+    anchor = dense_eval_anchor_step(cfg)
+    if cfg.dense_eval_interval <= 0 or cfg.dense_eval_window <= 0 or anchor is None:
+        return False
+    if abs(global_step - anchor) > cfg.dense_eval_window:
+        return False
+    return abs(global_step - anchor) % cfg.dense_eval_interval == 0
 
 
 def method_to_mode(cfg: TrainConfig) -> str:
@@ -533,7 +567,7 @@ def main() -> None:
 
         loss_eval_ntp = None
         loss_eval_phase = None
-        if global_step % cfg.eval_interval == 0 or step == 0:
+        if should_run_eval(cfg, step, global_step):
             loss_eval_ntp = evaluate(model, composer, eval_loader, cfg, device, "ntp", cfg.online_eval_max_batches)
             loss_eval_phase = loss_eval_ntp if phase in {"ntp", "recovery"} else evaluate(model, composer, eval_loader, cfg, device, phase, cfg.online_eval_max_batches)
         if (step + 1) % cfg.save_interval == 0 or step + 1 == cfg.max_steps:
