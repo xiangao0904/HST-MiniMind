@@ -89,7 +89,8 @@ class SuperpositionComposer(nn.Module):
             gated = embeds * self.slot_gate.view(1, 1, self.config.superpose_size, self.hidden_size)
             return gated.sum(dim=2) / self.config.superpose_size
         if self.config.slot_gate_type == "embedding":
-            return (embeds + self.slot_embed(slots).view(1, 1, -1, self.hidden_size)).mean(dim=2)
+            slot_scale = 1.0 + torch.tanh(self.slot_embed(slots)).view(1, 1, -1, self.hidden_size)
+            return (embeds * slot_scale).sum(dim=2) / self.config.superpose_size
         raise ValueError(f"unknown slot_gate_type: {self.config.slot_gate_type}")
 
     def _add_hierarchy(self, local_z: torch.Tensor) -> torch.Tensor:
@@ -99,9 +100,20 @@ class SuperpositionComposer(nn.Module):
         if padded_len != chunk_len:
             pad = local_z.new_zeros(bsz, padded_len - chunk_len, hidden)
             work = torch.cat([local_z, pad], dim=1)
+            valid = torch.cat(
+                [
+                    local_z.new_ones(bsz, chunk_len, 1),
+                    local_z.new_zeros(bsz, padded_len - chunk_len, 1),
+                ],
+                dim=1,
+            )
         else:
             work = local_z
-        block_z = work.view(bsz, -1, block, hidden).mean(dim=2)
-        block_z = block_z.repeat_interleave(block, dim=1)[:, :chunk_len, :]
+            valid = local_z.new_ones(bsz, chunk_len, 1)
+        block_work = work.view(bsz, -1, block, hidden)
+        block_valid = valid.view(bsz, -1, block, 1)
+        prefix_sum = block_work.cumsum(dim=2)
+        prefix_count = block_valid.cumsum(dim=2).clamp_min(1.0)
+        block_z = (prefix_sum / prefix_count).view(bsz, padded_len, hidden)[:, :chunk_len, :]
         block_z = block_z + self.block_type_embed.weight.view(1, 1, hidden)
         return local_z + self.config.hier_alpha * block_z
