@@ -20,6 +20,7 @@ hst_outputs/offline_eval_summary.md
 hst_outputs/recovery_analysis.md
 hst_tmp/
 dataset/
+tokenizer/
 
 *.log
 *.pt
