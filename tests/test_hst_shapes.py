@@ -138,6 +138,22 @@ class SuperpositionShapeTest(unittest.TestCase):
         self.assertTrue(torch.allclose(first_z[:, :2], second_z[:, :2]))
         self.assertFalse(torch.allclose(first_z[:, 2], second_z[:, 2]))
 
+    def test_residual_structured_first_chunk_keeps_mean_without_order(self):
+        embed = nn.Embedding(64, 8)
+        batch = torch.randint(0, 64, (2, 16))
+        mean_cfg = SuperpositionConfig(mode="mean", superpose_size=4, hidden_size=8, vocab_size=64)
+        residual_cfg = SuperpositionConfig(
+            mode="residual_structured",
+            superpose_size=4,
+            hidden_size=8,
+            vocab_size=64,
+            order_alpha=0.0,
+            hier_alpha=0.5,
+        )
+        mean_z = SuperpositionComposer(embed, 8, 64, mean_cfg).compose(batch)["inputs_embeds"]
+        residual_z = SuperpositionComposer(embed, 8, 64, residual_cfg).compose(batch)["inputs_embeds"]
+        self.assertTrue(torch.allclose(mean_z[:, 0], residual_z[:, 0]))
+
 
 if __name__ == "__main__":
     unittest.main()

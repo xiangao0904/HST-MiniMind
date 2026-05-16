@@ -112,14 +112,14 @@ class SuperpositionComposer(nn.Module):
         z_mean = embeds.mean(dim=2)
         order_residual = self._order_residual(embeds, z_mean)
         local_z = z_mean + self.config.order_alpha * order_residual
-        hier_residual = self._causal_block_summary(local_z) - local_z
+        hier_residual = self._causal_block_summary(local_z, add_block_type=False) - local_z
         return local_z + self.config.hier_alpha * hier_residual
 
     def _add_hierarchy(self, local_z: torch.Tensor) -> torch.Tensor:
         block_z = self._causal_block_summary(local_z)
         return local_z + self.config.hier_alpha * block_z
 
-    def _causal_block_summary(self, local_z: torch.Tensor) -> torch.Tensor:
+    def _causal_block_summary(self, local_z: torch.Tensor, add_block_type: bool = True) -> torch.Tensor:
         bsz, chunk_len, hidden = local_z.shape
         block = max(1, self.config.chunks_per_block)
         padded_len = ((chunk_len + block - 1) // block) * block
@@ -141,4 +141,6 @@ class SuperpositionComposer(nn.Module):
         prefix_sum = block_work.cumsum(dim=2)
         prefix_count = block_valid.cumsum(dim=2).clamp_min(1.0)
         block_z = (prefix_sum / prefix_count).view(bsz, padded_len, hidden)[:, :chunk_len, :]
-        return block_z + self.block_type_embed.weight.view(1, 1, hidden)
+        if add_block_type:
+            block_z = block_z + self.block_type_embed.weight.view(1, 1, hidden)
+        return block_z

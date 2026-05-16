@@ -10,7 +10,7 @@ max_seq_len: 64
 learning_rate: 0.0003
 seed: 42
 superpose_size: 4
-loss_mode: ordered_slot
+loss_mode: repeated_ce
 slot_gate_type: embedding
 order_alpha: 0.05
 hier_alpha: 0.05
