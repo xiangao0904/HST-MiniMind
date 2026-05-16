@@ -16,6 +16,7 @@ class SuperpositionConfig:
     type_vocab_size: int = 11
     block_mode: str = "fixed"
     chunks_per_block: int = 8
+    order_alpha: float = 0.1
     hier_alpha: float = 0.1
 
 
@@ -81,6 +82,8 @@ class SuperpositionComposer(nn.Module):
             return (embeds + self.type_embed(type_ids)).mean(dim=2)
         if mode == "hierarchical":
             return self._order_aware(embeds)
+        if mode == "residual_structured":
+            return self._residual_structured(embeds)
         raise ValueError(f"unknown superposition mode: {mode}")
 
     def _order_aware(self, embeds: torch.Tensor) -> torch.Tensor:
@@ -93,7 +96,30 @@ class SuperpositionComposer(nn.Module):
             return (embeds * slot_scale).sum(dim=2) / self.config.superpose_size
         raise ValueError(f"unknown slot_gate_type: {self.config.slot_gate_type}")
 
+    def _order_residual(self, embeds: torch.Tensor, z_mean: torch.Tensor) -> torch.Tensor:
+        slots = torch.arange(self.config.superpose_size, device=embeds.device)
+        if self.config.slot_gate_type == "diagonal":
+            slot_weight = self.slot_gate.view(1, 1, self.config.superpose_size, self.hidden_size)
+        elif self.config.slot_gate_type == "embedding":
+            slot_weight = torch.tanh(self.slot_embed(slots)).view(1, 1, -1, self.hidden_size)
+        else:
+            raise ValueError(f"unknown slot_gate_type: {self.config.slot_gate_type}")
+        slot_weight = slot_weight - slot_weight.mean(dim=2, keepdim=True)
+        token_delta = embeds - z_mean.unsqueeze(2)
+        return (token_delta * slot_weight).sum(dim=2) / self.config.superpose_size
+
+    def _residual_structured(self, embeds: torch.Tensor) -> torch.Tensor:
+        z_mean = embeds.mean(dim=2)
+        order_residual = self._order_residual(embeds, z_mean)
+        local_z = z_mean + self.config.order_alpha * order_residual
+        hier_residual = self._causal_block_summary(local_z) - local_z
+        return local_z + self.config.hier_alpha * hier_residual
+
     def _add_hierarchy(self, local_z: torch.Tensor) -> torch.Tensor:
+        block_z = self._causal_block_summary(local_z)
+        return local_z + self.config.hier_alpha * block_z
+
+    def _causal_block_summary(self, local_z: torch.Tensor) -> torch.Tensor:
         bsz, chunk_len, hidden = local_z.shape
         block = max(1, self.config.chunks_per_block)
         padded_len = ((chunk_len + block - 1) // block) * block
@@ -115,5 +141,4 @@ class SuperpositionComposer(nn.Module):
         prefix_sum = block_work.cumsum(dim=2)
         prefix_count = block_valid.cumsum(dim=2).clamp_min(1.0)
         block_z = (prefix_sum / prefix_count).view(bsz, padded_len, hidden)[:, :chunk_len, :]
-        block_z = block_z + self.block_type_embed.weight.view(1, 1, hidden)
-        return local_z + self.config.hier_alpha * block_z
+        return block_z + self.block_type_embed.weight.view(1, 1, hidden)

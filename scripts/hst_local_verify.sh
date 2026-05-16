@@ -28,3 +28,4 @@ COMMON_ARGS=(
 "$PYTHON_BIN" trainer/train_hst_pretrain.py --method order_aware_tst --run_name verify_order --output_dir "$PROJECT_ROOT/hst_runs/verify_order" --superpose_size 2 --slot_gate_type embedding "${COMMON_ARGS[@]}"
 "$PYTHON_BIN" trainer/train_hst_pretrain.py --method boundary_aware_tst --run_name verify_boundary --output_dir "$PROJECT_ROOT/hst_runs/verify_boundary" --superpose_size 2 "${COMMON_ARGS[@]}"
 "$PYTHON_BIN" trainer/train_hst_pretrain.py --method hierarchical_tst --run_name verify_hier --output_dir "$PROJECT_ROOT/hst_runs/verify_hier" --superpose_size 4 --loss_mode ordered_slot --recovery_ratio 0.34 "${COMMON_ARGS[@]}"
+"$PYTHON_BIN" trainer/train_hst_pretrain.py --method residual_structured_tst --run_name verify_residual_structured --output_dir "$PROJECT_ROOT/hst_runs/verify_residual_structured" --superpose_size 4 --loss_mode ordered_slot --order_alpha 0.05 --hier_alpha 0.05 --recovery_ratio 0.34 "${COMMON_ARGS[@]}"

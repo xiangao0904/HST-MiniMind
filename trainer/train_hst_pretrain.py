@@ -33,7 +33,14 @@ from model.hst_superposition import SuperpositionComposer, SuperpositionConfig
 from model.hst_token_types import build_token_type_cache
 
 
-METHODS = {"ntp_baseline", "vanilla_tst", "order_aware_tst", "boundary_aware_tst", "hierarchical_tst"}
+METHODS = {
+    "ntp_baseline",
+    "vanilla_tst",
+    "order_aware_tst",
+    "boundary_aware_tst",
+    "hierarchical_tst",
+    "residual_structured_tst",
+}
 
 
 @dataclass
@@ -71,6 +78,7 @@ class TrainConfig:
     tokenized_cache_path: str = ""
     block_mode: str = "fixed"
     chunks_per_block: int = 8
+    order_alpha: float = 0.1
     hier_alpha: float = 0.1
     slot_gate_type: str = "embedding"
     type_vocab_size: int = 11
@@ -275,6 +283,10 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("phase_override must be empty, ntp, superposition, or recovery")
     if cfg.phase_override == "superposition" and cfg.method == "ntp_baseline":
         raise ValueError("phase_override=superposition requires a TST method")
+    if cfg.order_alpha < 0.0:
+        raise ValueError("order_alpha must be non-negative")
+    if cfg.hier_alpha < 0.0:
+        raise ValueError("hier_alpha must be non-negative")
     if cfg.use_swanlab:
         raise ValueError("swanlab integration is not implemented")
 
@@ -329,6 +341,7 @@ def method_to_mode(cfg: TrainConfig) -> str:
         "order_aware_tst": "order_aware",
         "boundary_aware_tst": "boundary_aware",
         "hierarchical_tst": "hierarchical",
+        "residual_structured_tst": "residual_structured",
     }.get(cfg.method, cfg.superpose_mode)
 
 
@@ -532,6 +545,7 @@ def main() -> None:
             type_vocab_size=cfg.type_vocab_size,
             block_mode=cfg.block_mode,
             chunks_per_block=cfg.chunks_per_block,
+            order_alpha=cfg.order_alpha,
             hier_alpha=cfg.hier_alpha,
         )
         composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
