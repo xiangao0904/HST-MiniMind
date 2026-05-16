@@ -64,6 +64,11 @@ class TrainConfig:
     loss_mode: str = "repeated_ce"
     recovery_ratio: float = 0.0
     learning_rate: float = 3e-4
+    lr_scheduler: str = "constant"
+    lr_schedule_steps: int = 0
+    warmup_steps: int = 0
+    decay_ratio: float = 0.0
+    min_learning_rate: float = 0.0
     batch_size: int = 2
     max_seq_len: int = 128
     baseline_seq_len: int = 0
@@ -289,6 +294,18 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("hier_alpha must be non-negative")
     if cfg.use_swanlab:
         raise ValueError("swanlab integration is not implemented")
+    if cfg.lr_scheduler not in {"constant", "wsd"}:
+        raise ValueError("lr_scheduler must be constant or wsd")
+    if cfg.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if cfg.lr_schedule_steps < 0:
+        raise ValueError("lr_schedule_steps must be non-negative")
+    if not 0.0 <= cfg.decay_ratio <= 1.0:
+        raise ValueError("decay_ratio must be in [0, 1]")
+    if cfg.min_learning_rate < 0.0:
+        raise ValueError("min_learning_rate must be non-negative")
+    if cfg.min_learning_rate > cfg.learning_rate:
+        raise ValueError("min_learning_rate must be <= learning_rate")
 
 
 def tst_ratio(cfg: TrainConfig) -> float:
@@ -310,6 +327,29 @@ def phase_for_step(cfg: TrainConfig, step: int) -> str:
         return "ntp"
     recovery_start = recovery_start_step(cfg)
     return "superposition" if step < recovery_start else "recovery"
+
+
+def learning_rate_for_step(cfg: TrainConfig, step: int) -> float:
+    if cfg.lr_scheduler == "constant":
+        return cfg.learning_rate
+    schedule_steps = cfg.lr_schedule_steps or cfg.max_steps
+    schedule_step = cfg.global_step_offset + step
+    step_num = schedule_step + 1
+    if cfg.warmup_steps > 0 and step_num <= cfg.warmup_steps:
+        return cfg.learning_rate * step_num / cfg.warmup_steps
+    decay_steps = int(schedule_steps * cfg.decay_ratio)
+    if decay_steps <= 0:
+        return cfg.learning_rate
+    decay_start = schedule_steps - decay_steps
+    if schedule_step < decay_start:
+        return cfg.learning_rate
+    progress = min(1.0, max(0.0, (schedule_step - decay_start + 1) / decay_steps))
+    return cfg.learning_rate - (cfg.learning_rate - cfg.min_learning_rate) * progress
+
+
+def set_optimizer_lr(optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 def dense_eval_anchor_step(cfg: TrainConfig) -> int | None:
@@ -572,6 +612,7 @@ def main() -> None:
         global_step = cfg.global_step_offset + step + 1
         phase = phase_for_step(cfg, step)
         batch = batch_for_phase(batch.to(device), cfg, phase)
+        set_optimizer_lr(optimizer, learning_rate_for_step(cfg, step))
         optimizer.zero_grad(set_to_none=True)
         loss = compute_loss(model, composer, batch, cfg, phase)
         if not torch.isfinite(loss):
