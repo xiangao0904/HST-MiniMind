@@ -18,6 +18,9 @@ class SuperpositionConfig:
     chunks_per_block: int = 8
     order_alpha: float = 0.1
     hier_alpha: float = 0.1
+    anchor_slot_idx: int = 0
+    residual_codebook_size: int = 256
+    sar_gate_threshold: float = 0.05
 
 
 class SuperpositionComposer(nn.Module):
@@ -39,6 +42,9 @@ class SuperpositionComposer(nn.Module):
         self.slot_gate = nn.Parameter(torch.ones(s, hidden_size))
         self.type_embed = nn.Embedding(config.type_vocab_size, hidden_size)
         self.block_type_embed = nn.Embedding(1, hidden_size)
+        residual_slots = max(1, s - 1)
+        self.residual_codebook = nn.Embedding(config.residual_codebook_size, hidden_size)
+        self.residual_head = nn.Linear(hidden_size, residual_slots * config.residual_codebook_size)
         if token_type_ids is None:
             token_type_ids = torch.zeros(vocab_size, dtype=torch.long)
         self.register_buffer("token_type_ids", token_type_ids.long(), persistent=False)
@@ -60,7 +66,7 @@ class SuperpositionComposer(nn.Module):
         if self.config.mode == "hierarchical":
             local_z = self._add_hierarchy(local_z)
         attention_mask = torch.ones(local_z.shape[:2], dtype=torch.long, device=local_z.device)
-        return {
+        result = {
             "inputs_embeds": local_z,
             "chunk_targets": target_chunks,
             "attention_mask": attention_mask,
@@ -70,6 +76,9 @@ class SuperpositionComposer(nn.Module):
                 "mode": self.config.mode,
             },
         }
+        if self.config.mode == "sparse_anchor_residual":
+            result.update(self._sparse_anchor_targets(source_chunks, target_chunks, embeds, local_z))
+        return result
 
     def _compose_local(self, source_chunks: torch.Tensor, embeds: torch.Tensor) -> torch.Tensor:
         mode = self.config.mode
@@ -84,6 +93,8 @@ class SuperpositionComposer(nn.Module):
             return self._order_aware(embeds)
         if mode == "residual_structured":
             return self._residual_structured(embeds)
+        if mode == "sparse_anchor_residual":
+            return self._sparse_anchor_residual(embeds)
         raise ValueError(f"unknown superposition mode: {mode}")
 
     def _order_aware(self, embeds: torch.Tensor) -> torch.Tensor:
@@ -114,6 +125,58 @@ class SuperpositionComposer(nn.Module):
         local_z = z_mean + self.config.order_alpha * order_residual
         hier_residual = self._causal_block_summary(local_z, add_block_type=False) - local_z
         return local_z + self.config.hier_alpha * hier_residual
+
+    def _sparse_anchor_residual(self, embeds: torch.Tensor) -> torch.Tensor:
+        z_mean = embeds.mean(dim=2)
+        order_residual = self._order_residual(embeds, z_mean)
+        gate_mask = self._sar_gate_mask(order_residual)
+        local_z = z_mean + gate_mask * self.config.order_alpha * order_residual
+        if self.config.hier_alpha > 0.0:
+            hier_residual = self._causal_block_summary(local_z, add_block_type=False) - local_z
+            local_z = local_z + gate_mask * self.config.hier_alpha * hier_residual
+        return local_z
+
+    def _sar_gate_mask(self, residual: torch.Tensor) -> torch.Tensor:
+        gate_score = residual.pow(2).mean(dim=2, keepdim=True).sqrt()
+        return (gate_score > self.config.sar_gate_threshold).to(residual.dtype)
+
+    def _sparse_anchor_targets(
+        self,
+        source_chunks: torch.Tensor,
+        target_chunks: torch.Tensor,
+        source_embeds: torch.Tensor,
+        local_z: torch.Tensor,
+    ) -> dict[str, torch.Tensor | dict[str, float]]:
+        anchor_idx = self.config.anchor_slot_idx
+        target_embeds = self.token_embedding(target_chunks)
+        anchor_targets = target_chunks[:, :, anchor_idx]
+        if self.config.superpose_size <= 1:
+            residual_code_targets = target_chunks.new_zeros(target_chunks.size(0), target_chunks.size(1), 1)
+        else:
+            residual_slots = [slot for slot in range(self.config.superpose_size) if slot != anchor_idx]
+            residual_embeds = target_embeds[:, :, residual_slots, :]
+            anchor_embed = target_embeds[:, :, anchor_idx : anchor_idx + 1, :]
+            delta = residual_embeds - anchor_embed
+            codebook = self.residual_codebook.weight
+            dist = (
+                delta.pow(2).sum(dim=-1, keepdim=True)
+                - 2.0 * torch.matmul(delta, codebook.t())
+                + codebook.pow(2).sum(dim=1).view(1, 1, 1, -1)
+            )
+            residual_code_targets = dist.argmin(dim=-1)
+        source_mean = source_embeds.mean(dim=2)
+        source_residual = self._order_residual(source_embeds, source_mean)
+        residual_gate_mask = self._sar_gate_mask(source_residual).squeeze(-1)
+        metadata = {
+            "sar_gate_rate": float(residual_gate_mask.float().mean().detach().cpu()),
+            "sar_anchor_slot": float(anchor_idx),
+        }
+        return {
+            "anchor_targets": anchor_targets,
+            "residual_code_targets": residual_code_targets,
+            "residual_gate_mask": residual_gate_mask,
+            "metadata": {**metadata, "usable_len": target_chunks.size(1), "mode": self.config.mode},
+        }
 
     def _add_hierarchy(self, local_z: torch.Tensor) -> torch.Tensor:
         block_z = self._causal_block_summary(local_z)

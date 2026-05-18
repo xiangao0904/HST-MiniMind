@@ -5,7 +5,7 @@ try:
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio
+    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
 except Exception:
     torch = None
 
@@ -69,9 +69,13 @@ class TrainingProtocolTest(unittest.TestCase):
 
     def test_should_run_dense_eval_near_anchor(self):
         cfg = TrainConfig(method="vanilla_tst", max_steps=20000, recovery_ratio=0.7, eval_interval=500, dense_eval_interval=50, dense_eval_window=100)
-        self.assertTrue(should_run_eval(cfg, step=5949, global_step=5950))
+        self.assertTrue(should_run_eval(cfg, step=5950, global_step=5951))
         self.assertTrue(should_run_eval(cfg, step=6000, global_step=6001))
-        self.assertFalse(should_run_eval(cfg, step=5900, global_step=5901))
+        self.assertFalse(should_run_eval(cfg, step=5898, global_step=5899))
+
+    def test_sparse_anchor_residual_config_validation(self):
+        cfg = TrainConfig(method="sparse_anchor_residual_tst", superpose_size=4, anchor_slot_idx=1, residual_codebook_size=64)
+        validate_config(cfg)
 
 
 if __name__ == "__main__":

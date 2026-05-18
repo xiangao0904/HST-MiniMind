@@ -28,7 +28,7 @@ try:
 except Exception as exc:  # pragma: no cover - exercised on machines without torch.
     raise SystemExit("PyTorch is required for training. Install it in a project/local environment.") from exc
 
-from model.hst_losses import ntp_loss, ordered_slot_loss, repeated_token_ce_loss
+from model.hst_losses import ntp_loss, ordered_slot_loss, repeated_token_ce_loss, sparse_anchor_residual_loss
 from model.hst_superposition import SuperpositionComposer, SuperpositionConfig
 from model.hst_token_types import build_token_type_cache
 
@@ -40,6 +40,7 @@ METHODS = {
     "boundary_aware_tst",
     "hierarchical_tst",
     "residual_structured_tst",
+    "sparse_anchor_residual_tst",
 }
 
 
@@ -87,6 +88,10 @@ class TrainConfig:
     hier_alpha: float = 0.1
     slot_gate_type: str = "embedding"
     type_vocab_size: int = 11
+    anchor_slot_idx: int = 0
+    residual_codebook_size: int = 256
+    sar_gate_threshold: float = 0.05
+    residual_loss_weight: float = 0.5
     log_jsonl: str = "metrics.jsonl"
     use_wandb: int = 0
     wandb_project: str = "hst-minimind"
@@ -294,6 +299,14 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("hier_alpha must be non-negative")
     if cfg.use_swanlab:
         raise ValueError("swanlab integration is not implemented")
+    if cfg.anchor_slot_idx < 0 or cfg.anchor_slot_idx >= cfg.superpose_size:
+        raise ValueError("anchor_slot_idx must be in [0, superpose_size)")
+    if cfg.residual_codebook_size <= 0:
+        raise ValueError("residual_codebook_size must be positive")
+    if cfg.sar_gate_threshold < 0.0:
+        raise ValueError("sar_gate_threshold must be non-negative")
+    if cfg.residual_loss_weight < 0.0:
+        raise ValueError("residual_loss_weight must be non-negative")
     if cfg.lr_scheduler not in {"constant", "wsd"}:
         raise ValueError("lr_scheduler must be constant or wsd")
     if cfg.warmup_steps < 0:
@@ -382,6 +395,7 @@ def method_to_mode(cfg: TrainConfig) -> str:
         "boundary_aware_tst": "boundary_aware",
         "hierarchical_tst": "hierarchical",
         "residual_structured_tst": "residual_structured",
+        "sparse_anchor_residual_tst": "sparse_anchor_residual",
     }.get(cfg.method, cfg.superpose_mode)
 
 
@@ -433,6 +447,17 @@ def compute_loss(model, composer, batch: torch.Tensor, cfg: TrainConfig, phase: 
         raise ValueError("superposition phase requires a composer")
     composed = composer.compose(batch)
     out = model(inputs_embeds=composed["inputs_embeds"])
+    if cfg.loss_mode == "sparse_anchor_residual":
+        return sparse_anchor_residual_loss(
+            out["logits"],
+            out["hidden_states"],
+            composed["anchor_targets"],
+            composed["residual_code_targets"],
+            composer.residual_head,
+            cfg.residual_codebook_size,
+            composed["residual_gate_mask"],
+            cfg.residual_loss_weight,
+        )
     if cfg.loss_mode == "ordered_slot":
         return ordered_slot_loss(out["hidden_states"], composed["chunk_targets"], model.lm_head, composer.slot_embed)
     return repeated_token_ce_loss(out["logits"], composed["chunk_targets"])
@@ -587,6 +612,9 @@ def main() -> None:
             chunks_per_block=cfg.chunks_per_block,
             order_alpha=cfg.order_alpha,
             hier_alpha=cfg.hier_alpha,
+            anchor_slot_idx=cfg.anchor_slot_idx,
+            residual_codebook_size=cfg.residual_codebook_size,
+            sar_gate_threshold=cfg.sar_gate_threshold,
         )
         composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
     model_param_ids = {id(p) for p in model.parameters()}
