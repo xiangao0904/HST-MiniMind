@@ -6,6 +6,11 @@ Date: 2026-05-18
 
 Design and test a residual-based TST variant that is more likely to improve wall-clock step speedup than the current `residual_structured_tst`, while preserving the main stability benefit of a vanilla-mean backbone.
 
+Important baseline constraint:
+
+- the reference vanilla must be the paper-style vanilla TST protocol
+- `SAR-TST` should be treated as a modification on top of that paper-vanilla backbone, not as a tweak on top of the older structured residual line
+
 Working name:
 
 - `SAR-TST`
@@ -30,6 +35,14 @@ But it is still dense in two places:
 4. Predict the remaining `s-1` slots with a small residual-code objective instead of full-token recovery.
 
 This is intended to improve the speed-quality tradeoff rather than raw representational power.
+
+Operationally, the intended backbone is:
+
+- paper-style vanilla TST
+- same equal-FLOPs setup
+- same repeated CE target family
+- same optimizer/LR family
+- same WSD scheduler shape when using the paper-aligned long-run configs
 
 ## Method Definition
 
@@ -128,7 +141,13 @@ Keep fixed:
 - `recovery_ratio = 0.7`
 - same tokenizer/cache
 - same optimizer/LR
+- same WSD scheduler shape
 - same model size
+
+Interpretation rule:
+
+- `P2_vanilla_tst_s4_r03_full_120k` is the true control
+- `S4_sparse_anchor_residual_s4_r03_full_120k` should differ from that control only by the SAR residual path and its auxiliary target
 
 Primary questions:
 
