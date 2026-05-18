@@ -2,10 +2,11 @@ import unittest
 
 try:
     import torch
+    import yaml
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
+    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, method_to_mode, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
 except Exception:
     torch = None
 
@@ -76,6 +77,38 @@ class TrainingProtocolTest(unittest.TestCase):
     def test_sparse_anchor_residual_config_validation(self):
         cfg = TrainConfig(method="sparse_anchor_residual_tst", superpose_size=4, anchor_slot_idx=1, residual_codebook_size=64)
         validate_config(cfg)
+
+    def test_paper_residual_structured_uses_residual_composer_and_repeated_ce(self):
+        cfg = TrainConfig(
+            method="paper_residual_structured_tst",
+            baseline_seq_len=128,
+            max_seq_len=128,
+            superpose_size=4,
+            paper_equal_flops=1,
+            loss_mode="repeated_ce",
+        )
+        validate_config(cfg)
+        self.assertEqual(method_to_mode(cfg), "residual_structured")
+        self.assertEqual(train_raw_seq_len(cfg), 512)
+
+    def test_paper_residual_structured_full_config_matches_vanilla_protocol(self):
+        vanilla = yaml.safe_load(Path("configs/hst/paper_vanilla_tst_s4_r03_full_120k.yaml").read_text(encoding="utf-8"))
+        residual = yaml.safe_load(Path("configs/hst/paper_residual_structured_s4_r03_full_120k.yaml").read_text(encoding="utf-8"))
+        allowed_diffs = {
+            "method",
+            "run_name",
+            "output_dir",
+            "slot_gate_type",
+            "order_alpha",
+            "hier_alpha",
+            "block_mode",
+            "chunks_per_block",
+        }
+        diffs = {key for key in set(vanilla) | set(residual) if vanilla.get(key) != residual.get(key)}
+        self.assertEqual(diffs, allowed_diffs)
+        self.assertEqual(residual["method"], "paper_residual_structured_tst")
+        self.assertEqual(residual["loss_mode"], "repeated_ce")
+        self.assertEqual(residual["lr_scheduler"], "wsd")
 
 
 if __name__ == "__main__":

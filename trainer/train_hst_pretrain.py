@@ -40,6 +40,7 @@ METHODS = {
     "boundary_aware_tst",
     "hierarchical_tst",
     "residual_structured_tst",
+    "paper_residual_structured_tst",
     "sparse_anchor_residual_tst",
 }
 
@@ -395,6 +396,7 @@ def method_to_mode(cfg: TrainConfig) -> str:
         "boundary_aware_tst": "boundary_aware",
         "hierarchical_tst": "hierarchical",
         "residual_structured_tst": "residual_structured",
+        "paper_residual_structured_tst": "residual_structured",
         "sparse_anchor_residual_tst": "sparse_anchor_residual",
     }.get(cfg.method, cfg.superpose_mode)
 
