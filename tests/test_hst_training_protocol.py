@@ -6,7 +6,7 @@ try:
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, method_to_mode, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
+    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, method_to_mode, model_seq_len, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
 except Exception:
     torch = None
 
@@ -109,6 +109,32 @@ class TrainingProtocolTest(unittest.TestCase):
         self.assertEqual(residual["method"], "paper_residual_structured_tst")
         self.assertEqual(residual["loss_mode"], "repeated_ce")
         self.assertEqual(residual["lr_scheduler"], "wsd")
+
+    def test_adaptive_method_uses_adaptive_composer_and_larger_position_budget(self):
+        cfg = TrainConfig(
+            method="adaptive_residual_tst",
+            baseline_seq_len=128,
+            max_seq_len=128,
+            superpose_size=8,
+            adaptive_min_superpose_size=4,
+            paper_equal_flops=1,
+        )
+        validate_config(cfg)
+        self.assertEqual(method_to_mode(cfg), "adaptive_residual_structured")
+        self.assertEqual(train_raw_seq_len(cfg), 1024)
+        self.assertEqual(model_seq_len(cfg), 256)
+
+    def test_calibrated_methods_validate_protocol_fields(self):
+        cfg = TrainConfig(
+            method="adaptive_calibrated_tst",
+            superpose_size=8,
+            adaptive_min_superpose_size=4,
+            calibration_loss_weight=0.1,
+            calibration_seq_len=192,
+            calibration_interval=2,
+        )
+        validate_config(cfg)
+        self.assertEqual(method_to_mode(cfg), "adaptive_residual_structured")
 
 
 if __name__ == "__main__":

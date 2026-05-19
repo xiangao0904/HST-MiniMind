@@ -41,6 +41,9 @@ METHODS = {
     "hierarchical_tst",
     "residual_structured_tst",
     "paper_residual_structured_tst",
+    "adaptive_residual_tst",
+    "calibrated_paper_residual_tst",
+    "adaptive_calibrated_tst",
     "sparse_anchor_residual_tst",
 }
 
@@ -93,6 +96,12 @@ class TrainConfig:
     residual_codebook_size: int = 256
     sar_gate_threshold: float = 0.05
     residual_loss_weight: float = 0.5
+    adaptive_min_superpose_size: int = 4
+    adaptive_hard_token_types: str = "3,9,10"
+    adaptive_hard_threshold: float = 0.0
+    calibration_loss_weight: float = 0.0
+    calibration_seq_len: int = 0
+    calibration_interval: int = 1
     log_jsonl: str = "metrics.jsonl"
     use_wandb: int = 0
     wandb_project: str = "hst-minimind"
@@ -308,6 +317,19 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("sar_gate_threshold must be non-negative")
     if cfg.residual_loss_weight < 0.0:
         raise ValueError("residual_loss_weight must be non-negative")
+    if cfg.adaptive_min_superpose_size <= 0:
+        raise ValueError("adaptive_min_superpose_size must be positive")
+    if cfg.adaptive_min_superpose_size > cfg.superpose_size or cfg.superpose_size % cfg.adaptive_min_superpose_size != 0:
+        raise ValueError("adaptive_min_superpose_size must divide superpose_size")
+    parse_int_csv(cfg.adaptive_hard_token_types)
+    if not 0.0 <= cfg.adaptive_hard_threshold <= 1.0:
+        raise ValueError("adaptive_hard_threshold must be in [0, 1]")
+    if cfg.calibration_loss_weight < 0.0:
+        raise ValueError("calibration_loss_weight must be non-negative")
+    if cfg.calibration_seq_len < 0:
+        raise ValueError("calibration_seq_len must be non-negative")
+    if cfg.calibration_interval <= 0:
+        raise ValueError("calibration_interval must be positive")
     if cfg.lr_scheduler not in {"constant", "wsd"}:
         raise ValueError("lr_scheduler must be constant or wsd")
     if cfg.warmup_steps < 0:
@@ -320,6 +342,21 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("min_learning_rate must be non-negative")
     if cfg.min_learning_rate > cfg.learning_rate:
         raise ValueError("min_learning_rate must be <= learning_rate")
+
+
+def parse_int_csv(value: str) -> list[int]:
+    try:
+        return [int(item) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"invalid integer CSV: {value}") from exc
+
+
+def is_adaptive_method(cfg: TrainConfig) -> bool:
+    return cfg.method in {"adaptive_residual_tst", "adaptive_calibrated_tst"}
+
+
+def uses_calibration(cfg: TrainConfig) -> bool:
+    return cfg.calibration_loss_weight > 0.0 or cfg.method in {"calibrated_paper_residual_tst", "adaptive_calibrated_tst"}
 
 
 def tst_ratio(cfg: TrainConfig) -> float:
@@ -397,6 +434,9 @@ def method_to_mode(cfg: TrainConfig) -> str:
         "hierarchical_tst": "hierarchical",
         "residual_structured_tst": "residual_structured",
         "paper_residual_structured_tst": "residual_structured",
+        "calibrated_paper_residual_tst": "residual_structured",
+        "adaptive_residual_tst": "adaptive_residual_structured",
+        "adaptive_calibrated_tst": "adaptive_residual_structured",
         "sparse_anchor_residual_tst": "sparse_anchor_residual",
     }.get(cfg.method, cfg.superpose_mode)
 
@@ -411,6 +451,13 @@ def train_raw_seq_len(cfg: TrainConfig) -> int:
     if cfg.paper_equal_flops and cfg.method != "ntp_baseline":
         return baseline_seq_len(cfg) * cfg.superpose_size
     return cfg.max_seq_len
+
+
+def model_seq_len(cfg: TrainConfig) -> int:
+    if is_adaptive_method(cfg):
+        adaptive_raw_len = baseline_seq_len(cfg) * cfg.superpose_size
+        return max(baseline_seq_len(cfg), adaptive_raw_len // cfg.adaptive_min_superpose_size)
+    return baseline_seq_len(cfg)
 
 
 def batch_for_phase(batch: torch.Tensor, cfg: TrainConfig, phase: str) -> torch.Tensor:
@@ -437,12 +484,20 @@ def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, ph
             if i >= max_batches:
                 break
             batch = batch_for_phase(batch.to(device), cfg, phase)
-            losses.append(compute_loss(model, composer, batch, cfg, phase).detach())
+            losses.append(compute_loss(model, composer, batch, cfg, phase, include_calibration=False).detach())
     model.train()
     return float(torch.stack(losses).mean().cpu())
 
 
-def compute_loss(model, composer, batch: torch.Tensor, cfg: TrainConfig, phase: str) -> torch.Tensor:
+def compute_loss(
+    model,
+    composer,
+    batch: torch.Tensor,
+    cfg: TrainConfig,
+    phase: str,
+    step: int = 0,
+    include_calibration: bool = True,
+) -> torch.Tensor:
     if phase in {"ntp", "recovery"}:
         return ntp_loss(model(input_ids=batch)["logits"], batch)
     if composer is None:
@@ -461,8 +516,15 @@ def compute_loss(model, composer, batch: torch.Tensor, cfg: TrainConfig, phase: 
             cfg.residual_loss_weight,
         )
     if cfg.loss_mode == "ordered_slot":
-        return ordered_slot_loss(out["hidden_states"], composed["chunk_targets"], model.lm_head, composer.slot_embed)
-    return repeated_token_ce_loss(out["logits"], composed["chunk_targets"])
+        loss = ordered_slot_loss(out["hidden_states"], composed["chunk_targets"], model.lm_head, composer.slot_embed)
+    else:
+        loss = repeated_token_ce_loss(out["logits"], composed["chunk_targets"], composed.get("chunk_target_mask"))
+    if include_calibration and uses_calibration(cfg) and (step + 1) % cfg.calibration_interval == 0:
+        raw_len = cfg.calibration_seq_len or baseline_seq_len(cfg)
+        raw_len = min(raw_len, baseline_seq_len(cfg), batch.size(1))
+        if raw_len > 1:
+            loss = loss + cfg.calibration_loss_weight * ntp_loss(model(input_ids=batch[:, :raw_len])["logits"], batch[:, :raw_len])
+    return loss
 
 
 def save_checkpoint(path: Path, model, optimizer, step: int, cfg: TrainConfig, local_step: int | None = None) -> None:
@@ -546,6 +608,9 @@ def init_wandb(cfg: TrainConfig, output_dir: Path):
             "tst_ratio": tst_ratio(cfg),
             "baseline_seq_len": baseline_seq_len(cfg),
             "paper_equal_flops": cfg.paper_equal_flops,
+            "adaptive_min_superpose_size": cfg.adaptive_min_superpose_size,
+            "calibration_loss_weight": cfg.calibration_loss_weight,
+            "calibration_seq_len": cfg.calibration_seq_len,
         }
     )
     return run
@@ -561,6 +626,8 @@ def build_wandb_record(record: dict) -> dict:
         "raw_tokens_seen",
         "effective_data_tokens_seen",
         "gpu_mem_gb",
+        "adaptive_hard_window_rate",
+        "adaptive_effective_superpose_size",
     )
     return {key: record[key] for key in keys if record.get(key) is not None}
 
@@ -597,7 +664,7 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     eval_loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, drop_last=True)
     device = torch.device(cfg.device)
-    model = TinyCausalLM(vocab_size, baseline_seq_len(cfg), cfg.hidden_size, cfg.num_layers, cfg.num_heads, cfg.dropout).to(device)
+    model = TinyCausalLM(vocab_size, model_seq_len(cfg), cfg.hidden_size, cfg.num_layers, cfg.num_heads, cfg.dropout).to(device)
     if not id_to_text:
         id_to_text = {i: "" for i in range(vocab_size)}
     composer = None
@@ -617,6 +684,9 @@ def main() -> None:
             anchor_slot_idx=cfg.anchor_slot_idx,
             residual_codebook_size=cfg.residual_codebook_size,
             sar_gate_threshold=cfg.sar_gate_threshold,
+            adaptive_min_superpose_size=cfg.adaptive_min_superpose_size,
+            adaptive_hard_token_types=cfg.adaptive_hard_token_types,
+            adaptive_hard_threshold=cfg.adaptive_hard_threshold,
         )
         composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
     model_param_ids = {id(p) for p in model.parameters()}
@@ -644,7 +714,10 @@ def main() -> None:
         batch = batch_for_phase(batch.to(device), cfg, phase)
         set_optimizer_lr(optimizer, learning_rate_for_step(cfg, step))
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(model, composer, batch, cfg, phase)
+        loss = compute_loss(model, composer, batch, cfg, phase, step=step)
+        train_composer_metadata = (
+            dict(getattr(composer, "last_metadata", {})) if composer is not None and phase == "superposition" else {}
+        )
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {step}: {loss.item()}")
         loss.backward()
@@ -658,6 +731,9 @@ def main() -> None:
         if (step + 1) % cfg.save_interval == 0 or step + 1 == cfg.max_steps:
             save_checkpoint(ckpt_dir / f"step_{global_step}.pt", model, optimizer, global_step, cfg, local_step=step + 1)
         raw_step, latent_step, effective_step = token_counts(batch, cfg, phase)
+        if phase == "superposition" and train_composer_metadata:
+            latent_step = int(train_composer_metadata.get("latent_tokens", latent_step))
+            effective_step = int(train_composer_metadata.get("usable_tokens", effective_step))
         raw_tokens_seen += raw_step
         latent_tokens_seen += latent_step
         effective_data_tokens_seen += effective_step
@@ -689,6 +765,9 @@ def main() -> None:
             "wall_time_sec": time.time() - start_time,
             "gpu_mem_gb": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0,
         }
+        for key in ("adaptive_hard_window_rate", "adaptive_effective_superpose_size"):
+            if key in train_composer_metadata:
+                record[key] = train_composer_metadata[key]
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         if wandb_run is not None:

@@ -21,6 +21,13 @@ class HstLossTest(unittest.TestCase):
         targets = torch.randint(0, 17, (2, 4, 3))
         self.assertTrue(torch.isfinite(repeated_token_ce_loss(logits, targets)))
 
+    def test_repeated_ce_loss_accepts_target_mask(self):
+        logits = torch.randn(2, 4, 17)
+        targets = torch.randint(0, 17, (2, 4, 3))
+        mask = torch.ones(2, 4, 3, dtype=torch.bool)
+        mask[:, -1, 1:] = False
+        self.assertTrue(torch.isfinite(repeated_token_ce_loss(logits, targets, mask)))
+
     def test_ordered_slot_loss_is_finite(self):
         hidden = torch.randn(2, 4, 8)
         targets = torch.randint(0, 17, (2, 4, 3))

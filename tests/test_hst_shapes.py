@@ -182,6 +182,33 @@ class SuperpositionShapeTest(unittest.TestCase):
         sar_z = SuperpositionComposer(embed, 8, 64, sar_cfg).compose(batch)["inputs_embeds"]
         self.assertTrue(torch.allclose(mean_z, sar_z))
 
+    def test_adaptive_residual_packs_easy_windows_and_splits_hard_windows(self):
+        embed = nn.Embedding(64, 8)
+        token_types = torch.zeros(64, dtype=torch.long)
+        token_types[9] = 3
+        cfg = SuperpositionConfig(
+            mode="adaptive_residual_structured",
+            superpose_size=8,
+            adaptive_min_superpose_size=4,
+            hidden_size=8,
+            vocab_size=64,
+            order_alpha=0.0,
+            hier_alpha=0.0,
+            adaptive_hard_token_types="3",
+        )
+        composer = SuperpositionComposer(embed, 8, 64, cfg, token_types)
+        batch = torch.tensor(
+            [
+                [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18],
+                [1, 2, 3, 4, 9, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18],
+            ]
+        )
+        out = composer.compose(batch)
+        self.assertEqual(out["inputs_embeds"].shape, (2, 2, 8))
+        self.assertEqual(out["chunk_targets"].shape, (2, 2, 8))
+        self.assertEqual(out["chunk_target_mask"].sum().item(), 20)
+        self.assertAlmostEqual(out["metadata"]["adaptive_hard_window_rate"], 0.25)
+
 
 if __name__ == "__main__":
     unittest.main()

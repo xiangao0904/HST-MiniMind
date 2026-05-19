@@ -10,12 +10,21 @@ def ntp_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
 
-def repeated_token_ce_loss(logits: torch.Tensor, chunk_targets: torch.Tensor) -> torch.Tensor:
+def repeated_token_ce_loss(
+    logits: torch.Tensor,
+    chunk_targets: torch.Tensor,
+    chunk_target_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     if logits.size(1) != chunk_targets.size(1):
         raise ValueError("logits and chunk_targets must have the same chunk length")
     vocab = logits.size(-1)
     expanded = logits.unsqueeze(2).expand(-1, -1, chunk_targets.size(-1), -1)
-    return F.cross_entropy(expanded.reshape(-1, vocab), chunk_targets.reshape(-1))
+    if chunk_target_mask is None:
+        return F.cross_entropy(expanded.reshape(-1, vocab), chunk_targets.reshape(-1))
+    active = chunk_target_mask.reshape(-1) > 0
+    if not active.any():
+        return logits.new_zeros(())
+    return F.cross_entropy(expanded.reshape(-1, vocab)[active], chunk_targets.reshape(-1)[active])
 
 
 def ordered_slot_loss(hidden: torch.Tensor, chunk_targets: torch.Tensor, lm_head, out_slot_embed) -> torch.Tensor:
