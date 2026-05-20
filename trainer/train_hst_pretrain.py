@@ -43,6 +43,7 @@ METHODS = {
     "paper_residual_structured_tst",
     "adaptive_residual_tst",
     "calibrated_paper_residual_tst",
+    "conflict_adaptive_calibrated_tst",
     "adaptive_calibrated_tst",
     "sparse_anchor_residual_tst",
 }
@@ -102,6 +103,11 @@ class TrainConfig:
     calibration_loss_weight: float = 0.0
     calibration_seq_len: int = 0
     calibration_interval: int = 1
+    calibration_adaptive: int = 0
+    calibration_loss_weight_min: float = 0.0
+    calibration_loss_weight_max: float = 0.5
+    calibration_ema_beta: float = 0.98
+    calibration_ratio_eps: float = 1e-8
     log_jsonl: str = "metrics.jsonl"
     use_wandb: int = 0
     wandb_project: str = "hst-minimind"
@@ -244,6 +250,19 @@ class TinyCausalLM(nn.Module):
         return {"logits": self.lm_head(hidden), "hidden_states": hidden}
 
 
+@dataclass
+class CalibrationState:
+    ratio_ema: float | None = None
+    last_loss: float | None = None
+    last_weight: float | None = None
+    last_ratio_ema: float | None = None
+
+    def reset_last(self) -> None:
+        self.last_loss = None
+        self.last_weight = None
+        self.last_ratio_ema = None
+
+
 def load_texts(path: Path) -> list[str]:
     texts = []
     with path.open("r", encoding="utf-8") as f:
@@ -330,6 +349,14 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("calibration_seq_len must be non-negative")
     if cfg.calibration_interval <= 0:
         raise ValueError("calibration_interval must be positive")
+    if cfg.calibration_loss_weight_min < 0.0:
+        raise ValueError("calibration_loss_weight_min must be non-negative")
+    if cfg.calibration_loss_weight_max < cfg.calibration_loss_weight_min:
+        raise ValueError("calibration_loss_weight_max must be >= calibration_loss_weight_min")
+    if not 0.0 <= cfg.calibration_ema_beta < 1.0:
+        raise ValueError("calibration_ema_beta must be in [0, 1)")
+    if cfg.calibration_ratio_eps <= 0.0:
+        raise ValueError("calibration_ratio_eps must be positive")
     if cfg.lr_scheduler not in {"constant", "wsd"}:
         raise ValueError("lr_scheduler must be constant or wsd")
     if cfg.warmup_steps < 0:
@@ -356,7 +383,15 @@ def is_adaptive_method(cfg: TrainConfig) -> bool:
 
 
 def uses_calibration(cfg: TrainConfig) -> bool:
-    return cfg.calibration_loss_weight > 0.0 or cfg.method in {"calibrated_paper_residual_tst", "adaptive_calibrated_tst"}
+    return cfg.calibration_loss_weight > 0.0 or cfg.method in {
+        "calibrated_paper_residual_tst",
+        "conflict_adaptive_calibrated_tst",
+        "adaptive_calibrated_tst",
+    }
+
+
+def uses_adaptive_calibration(cfg: TrainConfig) -> bool:
+    return bool(cfg.calibration_adaptive) or cfg.method == "conflict_adaptive_calibrated_tst"
 
 
 def tst_ratio(cfg: TrainConfig) -> float:
@@ -435,6 +470,7 @@ def method_to_mode(cfg: TrainConfig) -> str:
         "residual_structured_tst": "residual_structured",
         "paper_residual_structured_tst": "residual_structured",
         "calibrated_paper_residual_tst": "residual_structured",
+        "conflict_adaptive_calibrated_tst": "residual_structured",
         "adaptive_residual_tst": "adaptive_residual_structured",
         "adaptive_calibrated_tst": "adaptive_residual_structured",
         "sparse_anchor_residual_tst": "sparse_anchor_residual",
@@ -489,6 +525,32 @@ def evaluate(model, composer, loader, cfg: TrainConfig, device: torch.device, ph
     return float(torch.stack(losses).mean().cpu())
 
 
+def calibration_weight_for_loss(
+    cfg: TrainConfig,
+    state: CalibrationState,
+    base_loss: torch.Tensor,
+    calibration_loss: torch.Tensor,
+) -> float:
+    calibration_value = float(calibration_loss.detach().cpu())
+    state.last_loss = calibration_value
+    if not uses_adaptive_calibration(cfg):
+        state.last_weight = cfg.calibration_loss_weight
+        state.last_ratio_ema = state.ratio_ema
+        return cfg.calibration_loss_weight
+
+    ratio_tensor = calibration_loss.detach() / base_loss.detach().clamp_min(cfg.calibration_ratio_eps)
+    ratio = float(ratio_tensor.cpu())
+    if state.ratio_ema is None:
+        state.ratio_ema = ratio
+    else:
+        state.ratio_ema = cfg.calibration_ema_beta * state.ratio_ema + (1.0 - cfg.calibration_ema_beta) * ratio
+    weight = cfg.calibration_loss_weight * state.ratio_ema
+    weight = min(max(weight, cfg.calibration_loss_weight_min), cfg.calibration_loss_weight_max)
+    state.last_weight = weight
+    state.last_ratio_ema = state.ratio_ema
+    return weight
+
+
 def compute_loss(
     model,
     composer,
@@ -497,7 +559,10 @@ def compute_loss(
     phase: str,
     step: int = 0,
     include_calibration: bool = True,
+    calibration_state: CalibrationState | None = None,
 ) -> torch.Tensor:
+    if calibration_state is not None:
+        calibration_state.reset_last()
     if phase in {"ntp", "recovery"}:
         return ntp_loss(model(input_ids=batch)["logits"], batch)
     if composer is None:
@@ -523,7 +588,12 @@ def compute_loss(
         raw_len = cfg.calibration_seq_len or baseline_seq_len(cfg)
         raw_len = min(raw_len, baseline_seq_len(cfg), batch.size(1))
         if raw_len > 1:
-            loss = loss + cfg.calibration_loss_weight * ntp_loss(model(input_ids=batch[:, :raw_len])["logits"], batch[:, :raw_len])
+            calibration_loss = ntp_loss(model(input_ids=batch[:, :raw_len])["logits"], batch[:, :raw_len])
+            if calibration_state is None:
+                weight = cfg.calibration_loss_weight
+            else:
+                weight = calibration_weight_for_loss(cfg, calibration_state, loss, calibration_loss)
+            loss = loss + weight * calibration_loss
     return loss
 
 
@@ -610,6 +680,10 @@ def init_wandb(cfg: TrainConfig, output_dir: Path):
             "paper_equal_flops": cfg.paper_equal_flops,
             "adaptive_min_superpose_size": cfg.adaptive_min_superpose_size,
             "calibration_loss_weight": cfg.calibration_loss_weight,
+            "calibration_adaptive": cfg.calibration_adaptive or int(cfg.method == "conflict_adaptive_calibrated_tst"),
+            "calibration_loss_weight_min": cfg.calibration_loss_weight_min,
+            "calibration_loss_weight_max": cfg.calibration_loss_weight_max,
+            "calibration_ema_beta": cfg.calibration_ema_beta,
             "calibration_seq_len": cfg.calibration_seq_len,
         }
     )
@@ -628,6 +702,9 @@ def build_wandb_record(record: dict) -> dict:
         "gpu_mem_gb",
         "adaptive_hard_window_rate",
         "adaptive_effective_superpose_size",
+        "calibration_loss",
+        "calibration_loss_weight_effective",
+        "calibration_loss_ratio_ema",
     )
     return {key: record[key] for key in keys if record.get(key) is not None}
 
@@ -701,6 +778,7 @@ def main() -> None:
     raw_tokens_seen = start_step * cfg.batch_size * dataset_seq_len
     latent_tokens_seen = start_step * cfg.batch_size * baseline_seq_len(cfg)
     effective_data_tokens_seen = raw_tokens_seen
+    calibration_state = CalibrationState()
 
     print(yaml.safe_dump(asdict(cfg), sort_keys=True))
     for step in range(start_step, cfg.max_steps):
@@ -714,7 +792,7 @@ def main() -> None:
         batch = batch_for_phase(batch.to(device), cfg, phase)
         set_optimizer_lr(optimizer, learning_rate_for_step(cfg, step))
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(model, composer, batch, cfg, phase, step=step)
+        loss = compute_loss(model, composer, batch, cfg, phase, step=step, calibration_state=calibration_state)
         train_composer_metadata = (
             dict(getattr(composer, "last_metadata", {})) if composer is not None and phase == "superposition" else {}
         )
@@ -765,6 +843,10 @@ def main() -> None:
             "wall_time_sec": time.time() - start_time,
             "gpu_mem_gb": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0,
         }
+        if calibration_state.last_loss is not None:
+            record["calibration_loss"] = calibration_state.last_loss
+            record["calibration_loss_weight_effective"] = calibration_state.last_weight
+            record["calibration_loss_ratio_ema"] = calibration_state.last_ratio_ema
         for key in ("adaptive_hard_window_rate", "adaptive_effective_superpose_size"):
             if key in train_composer_metadata:
                 record[key] = train_composer_metadata[key]

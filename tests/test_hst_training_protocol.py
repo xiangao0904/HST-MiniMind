@@ -6,7 +6,7 @@ try:
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import TrainConfig, batch_for_phase, baseline_seq_len, checkpoint_step, dense_eval_anchor_step, method_to_mode, model_seq_len, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
+    from trainer.train_hst_pretrain import CalibrationState, TrainConfig, batch_for_phase, baseline_seq_len, calibration_weight_for_loss, checkpoint_step, dense_eval_anchor_step, method_to_mode, model_seq_len, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
 except Exception:
     torch = None
 
@@ -135,6 +135,38 @@ class TrainingProtocolTest(unittest.TestCase):
         )
         validate_config(cfg)
         self.assertEqual(method_to_mode(cfg), "adaptive_residual_structured")
+
+    def test_conflict_adaptive_calibrated_uses_residual_composer(self):
+        cfg = TrainConfig(
+            method="conflict_adaptive_calibrated_tst",
+            superpose_size=4,
+            calibration_loss_weight=0.3,
+            calibration_seq_len=384,
+            calibration_loss_weight_min=0.0,
+            calibration_loss_weight_max=0.5,
+            calibration_ema_beta=0.98,
+        )
+        validate_config(cfg)
+        self.assertEqual(method_to_mode(cfg), "residual_structured")
+
+    def test_adaptive_calibration_weight_is_clamped(self):
+        cfg = TrainConfig(
+            method="conflict_adaptive_calibrated_tst",
+            calibration_loss_weight=0.3,
+            calibration_loss_weight_min=0.05,
+            calibration_loss_weight_max=0.5,
+            calibration_ema_beta=0.5,
+        )
+        state = CalibrationState()
+        weight = calibration_weight_for_loss(cfg, state, torch.tensor(1.0), torch.tensor(10.0))
+        self.assertEqual(weight, 0.5)
+        self.assertEqual(state.last_weight, 0.5)
+        self.assertIsNotNone(state.last_ratio_ema)
+
+    def test_invalid_adaptive_calibration_bounds_are_rejected(self):
+        cfg = TrainConfig(superpose_size=4, calibration_loss_weight_min=0.6, calibration_loss_weight_max=0.5)
+        with self.assertRaisesRegex(ValueError, "calibration_loss_weight_max"):
+            validate_config(cfg)
 
 
 if __name__ == "__main__":
