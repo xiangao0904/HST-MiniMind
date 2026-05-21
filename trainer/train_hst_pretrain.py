@@ -113,6 +113,8 @@ class TrainConfig:
     adaptive_recovery_patience: int = 3
     adaptive_recovery_min_superpose_steps: int = 30000
     adaptive_recovery_max_superpose_steps: int = 0
+    recovery_warm_start_steps: int = 0
+    recovery_calibration_weight: float = 0.0
     log_jsonl: str = "metrics.jsonl"
     use_wandb: int = 0
     wandb_project: str = "hst-minimind"
@@ -386,6 +388,10 @@ def validate_config(cfg: TrainConfig) -> None:
         and cfg.adaptive_recovery_min_superpose_steps > cfg.adaptive_recovery_max_superpose_steps
     ):
         raise ValueError("adaptive_recovery_min_superpose_steps must be <= adaptive_recovery_max_superpose_steps")
+    if cfg.recovery_warm_start_steps < 0:
+        raise ValueError("recovery_warm_start_steps must be non-negative")
+    if cfg.recovery_calibration_weight < 0.0:
+        raise ValueError("recovery_calibration_weight must be non-negative")
     if cfg.lr_scheduler not in {"constant", "wsd"}:
         raise ValueError("lr_scheduler must be constant or wsd")
     if cfg.warmup_steps < 0:
@@ -618,6 +624,16 @@ def calibration_weight_for_loss(
     return weight
 
 
+def recovery_warm_start_weight(cfg: TrainConfig, step: int, recovery_start: int) -> float:
+    if cfg.recovery_warm_start_steps <= 0 or cfg.recovery_calibration_weight <= 0.0:
+        return 0.0
+    elapsed = step - recovery_start
+    if elapsed < 0 or elapsed >= cfg.recovery_warm_start_steps:
+        return 0.0
+    progress = elapsed / cfg.recovery_warm_start_steps
+    return cfg.recovery_calibration_weight * (1.0 - progress)
+
+
 def compute_loss(
     model,
     composer,
@@ -627,11 +643,25 @@ def compute_loss(
     step: int = 0,
     include_calibration: bool = True,
     calibration_state: CalibrationState | None = None,
+    adaptive_recovery_start_step: int | None = None,
 ) -> torch.Tensor:
     if calibration_state is not None:
         calibration_state.reset_last()
     if phase in {"ntp", "recovery"}:
-        return ntp_loss(model(input_ids=batch)["logits"], batch)
+        loss = ntp_loss(model(input_ids=batch)["logits"], batch)
+        recovery_start = adaptive_recovery_start_step if adaptive_recovery_start_step is not None else recovery_start_step(cfg)
+        weight = recovery_warm_start_weight(cfg, step, recovery_start)
+        if include_calibration and phase == "recovery" and weight > 0.0:
+            raw_len = cfg.calibration_seq_len or baseline_seq_len(cfg)
+            raw_len = min(raw_len, baseline_seq_len(cfg), batch.size(1))
+            if raw_len > 1:
+                calibration_loss = ntp_loss(model(input_ids=batch[:, :raw_len])["logits"], batch[:, :raw_len])
+                if calibration_state is not None:
+                    calibration_state.last_loss = float(calibration_loss.detach().cpu())
+                    calibration_state.last_weight = weight
+                    calibration_state.last_ratio_ema = calibration_state.ratio_ema
+                loss = loss + weight * calibration_loss
+        return loss
     if composer is None:
         raise ValueError("superposition phase requires a composer")
     composed = composer.compose(batch)
@@ -757,6 +787,8 @@ def init_wandb(cfg: TrainConfig, output_dir: Path):
             "adaptive_recovery_patience": cfg.adaptive_recovery_patience,
             "adaptive_recovery_min_superpose_steps": cfg.adaptive_recovery_min_superpose_steps,
             "adaptive_recovery_max_superpose_steps": cfg.adaptive_recovery_max_superpose_steps,
+            "recovery_warm_start_steps": cfg.recovery_warm_start_steps,
+            "recovery_calibration_weight": cfg.recovery_calibration_weight,
         }
     )
     return run
@@ -780,6 +812,7 @@ def build_wandb_record(record: dict) -> dict:
         "adaptive_recovery_triggered",
         "adaptive_recovery_start_step",
         "adaptive_recovery_patience_count",
+        "recovery_warm_start_weight",
     )
     return {key: record[key] for key in keys if record.get(key) is not None}
 
@@ -868,7 +901,16 @@ def main() -> None:
         batch = batch_for_phase(batch.to(device), cfg, phase)
         set_optimizer_lr(optimizer, learning_rate_for_step(cfg, step))
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(model, composer, batch, cfg, phase, step=step, calibration_state=calibration_state)
+        loss = compute_loss(
+            model,
+            composer,
+            batch,
+            cfg,
+            phase,
+            step=step,
+            calibration_state=calibration_state,
+            adaptive_recovery_start_step=adaptive_recovery_state.triggered_step,
+        )
         train_composer_metadata = (
             dict(getattr(composer, "last_metadata", {})) if composer is not None and phase == "superposition" else {}
         )
@@ -922,6 +964,15 @@ def main() -> None:
             "adaptive_recovery_start_step": adaptive_recovery_state.triggered_step,
             "adaptive_recovery_patience_count": adaptive_recovery_state.patience_count,
             "adaptive_recovery_triggered": adaptive_recovery_state.last_triggered,
+            "recovery_warm_start_weight": recovery_warm_start_weight(
+                cfg,
+                step,
+                adaptive_recovery_state.triggered_step
+                if adaptive_recovery_state.triggered_step is not None
+                else recovery_start_step(cfg),
+            )
+            if phase == "recovery"
+            else 0.0,
             "wall_time_sec": time.time() - start_time,
             "gpu_mem_gb": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0,
         }

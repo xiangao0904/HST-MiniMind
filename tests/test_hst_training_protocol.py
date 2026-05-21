@@ -6,7 +6,7 @@ try:
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import AdaptiveRecoveryState, CalibrationState, TrainConfig, adaptive_recovery_deadline, batch_for_phase, baseline_seq_len, calibration_weight_for_loss, checkpoint_step, dense_eval_anchor_step, method_to_mode, maybe_update_adaptive_recovery, model_seq_len, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
+    from trainer.train_hst_pretrain import AdaptiveRecoveryState, CalibrationState, TrainConfig, adaptive_recovery_deadline, batch_for_phase, baseline_seq_len, calibration_weight_for_loss, checkpoint_step, dense_eval_anchor_step, method_to_mode, maybe_update_adaptive_recovery, model_seq_len, phase_for_step, recovery_start_step, recovery_warm_start_weight, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
 except Exception:
     torch = None
 
@@ -213,6 +213,27 @@ class TrainingProtocolTest(unittest.TestCase):
         self.assertEqual(cfg.recovery_ratio, 0.5)
         self.assertEqual(cfg.adaptive_recovery_switch, 1)
         self.assertEqual(method_to_mode(cfg), "residual_structured")
+
+    def test_recovery_warm_start_weight_decays_to_zero(self):
+        cfg = TrainConfig(recovery_warm_start_steps=10, recovery_calibration_weight=0.05)
+        self.assertAlmostEqual(recovery_warm_start_weight(cfg, 40, 40), 0.05)
+        self.assertAlmostEqual(recovery_warm_start_weight(cfg, 45, 40), 0.025)
+        self.assertEqual(recovery_warm_start_weight(cfg, 50, 40), 0.0)
+        self.assertEqual(recovery_warm_start_weight(cfg, 39, 40), 0.0)
+
+    def test_adaptive_recovery_warmstart_configs_are_valid(self):
+        for path, steps in [
+            ("configs/hst/adaptive_recovery_warmstart_s4_r05_w03_seq384_95k_ws3k.yaml", 3000),
+            ("configs/hst/adaptive_recovery_warmstart_s4_r05_w03_seq384_95k_ws5k.yaml", 5000),
+        ]:
+            cfg_data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+            cfg = TrainConfig(**cfg_data)
+            validate_config(cfg)
+            self.assertEqual(cfg.max_steps, 95000)
+            self.assertEqual(cfg.lr_schedule_steps, 95000)
+            self.assertEqual(cfg.recovery_warm_start_steps, steps)
+            self.assertEqual(cfg.recovery_calibration_weight, 0.05)
+            self.assertEqual(method_to_mode(cfg), "residual_structured")
 
 
 if __name__ == "__main__":
