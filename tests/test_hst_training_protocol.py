@@ -6,7 +6,7 @@ try:
 
     from pathlib import Path
 
-    from trainer.train_hst_pretrain import CalibrationState, TrainConfig, batch_for_phase, baseline_seq_len, calibration_weight_for_loss, checkpoint_step, dense_eval_anchor_step, method_to_mode, model_seq_len, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
+    from trainer.train_hst_pretrain import AdaptiveRecoveryState, CalibrationState, TrainConfig, adaptive_recovery_deadline, batch_for_phase, baseline_seq_len, calibration_weight_for_loss, checkpoint_step, dense_eval_anchor_step, method_to_mode, maybe_update_adaptive_recovery, model_seq_len, phase_for_step, recovery_start_step, should_run_eval, token_counts, train_raw_seq_len, tst_ratio, validate_config
 except Exception:
     torch = None
 
@@ -167,6 +167,52 @@ class TrainingProtocolTest(unittest.TestCase):
         cfg = TrainConfig(superpose_size=4, calibration_loss_weight_min=0.6, calibration_loss_weight_max=0.5)
         with self.assertRaisesRegex(ValueError, "calibration_loss_weight_max"):
             validate_config(cfg)
+
+    def test_adaptive_recovery_switch_triggers_from_ratio_ema(self):
+        cfg = TrainConfig(
+            method="conflict_adaptive_calibrated_tst",
+            max_steps=100,
+            superpose_size=4,
+            recovery_ratio=0.5,
+            calibration_adaptive=1,
+            adaptive_recovery_switch=1,
+            adaptive_recovery_threshold=0.66,
+            adaptive_recovery_patience=2,
+            adaptive_recovery_min_superpose_steps=10,
+        )
+        validate_config(cfg)
+        recovery_state = AdaptiveRecoveryState()
+        calibration_state = CalibrationState(last_ratio_ema=0.65)
+        maybe_update_adaptive_recovery(cfg, recovery_state, calibration_state, 9, "superposition")
+        self.assertIsNone(recovery_state.triggered_step)
+        maybe_update_adaptive_recovery(cfg, recovery_state, calibration_state, 10, "superposition")
+        self.assertEqual(recovery_state.triggered_step, 11)
+        self.assertEqual(phase_for_step(cfg, 11, recovery_state.triggered_step), "recovery")
+
+    def test_adaptive_recovery_deadline_caps_planned_recovery_start(self):
+        cfg = TrainConfig(
+            method="conflict_adaptive_calibrated_tst",
+            max_steps=100,
+            superpose_size=4,
+            recovery_ratio=0.5,
+            calibration_adaptive=1,
+            adaptive_recovery_switch=1,
+            adaptive_recovery_min_superpose_steps=10,
+            adaptive_recovery_max_superpose_steps=40,
+        )
+        validate_config(cfg)
+        self.assertEqual(recovery_start_step(cfg), 50)
+        self.assertEqual(adaptive_recovery_deadline(cfg), 40)
+
+    def test_adaptive_recovery_95k_config_is_valid(self):
+        cfg_data = yaml.safe_load(Path("configs/hst/adaptive_recovery_conflict_s4_r05_w03_seq384_95k.yaml").read_text(encoding="utf-8"))
+        cfg = TrainConfig(**cfg_data)
+        validate_config(cfg)
+        self.assertEqual(cfg.max_steps, 95000)
+        self.assertEqual(cfg.lr_schedule_steps, 95000)
+        self.assertEqual(cfg.recovery_ratio, 0.5)
+        self.assertEqual(cfg.adaptive_recovery_switch, 1)
+        self.assertEqual(method_to_mode(cfg), "residual_structured")
 
 
 if __name__ == "__main__":
