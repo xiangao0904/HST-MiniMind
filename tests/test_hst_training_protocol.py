@@ -214,14 +214,19 @@ class TrainingProtocolTest(unittest.TestCase):
         self.assertEqual(cfg.adaptive_recovery_switch, 1)
         self.assertEqual(method_to_mode(cfg), "residual_structured")
 
-    def test_adaptive_recovery_t064_config_is_valid(self):
-        cfg_data = yaml.safe_load(Path("configs/hst/adaptive_recovery_conflict_s4_r05_w03_seq384_95k_t064.yaml").read_text(encoding="utf-8"))
-        cfg = TrainConfig(**cfg_data)
-        validate_config(cfg)
-        self.assertEqual(cfg.max_steps, 95000)
-        self.assertEqual(cfg.lr_schedule_steps, 95000)
-        self.assertEqual(cfg.adaptive_recovery_threshold, 0.64)
-        self.assertEqual(method_to_mode(cfg), "residual_structured")
+    def test_conflict_adaptive_100k_replica_configs_are_valid(self):
+        for path, seed in [
+            ("configs/hst/conflict_adaptive_calibrated_s4_r05_w03_seq384_100k_replica_seed42.yaml", 42),
+            ("configs/hst/conflict_adaptive_calibrated_s4_r05_w03_seq384_100k_replica_seed43.yaml", 43),
+        ]:
+            cfg_data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+            cfg = TrainConfig(**cfg_data)
+            validate_config(cfg)
+            self.assertEqual(cfg.max_steps, 100000)
+            self.assertEqual(cfg.lr_schedule_steps, 100000)
+            self.assertEqual(cfg.recovery_ratio, 0.5)
+            self.assertEqual(cfg.seed, seed)
+            self.assertEqual(method_to_mode(cfg), "residual_structured")
 
 
 if __name__ == "__main__":
