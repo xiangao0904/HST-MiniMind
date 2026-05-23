@@ -28,7 +28,7 @@ try:
 except Exception as exc:  # pragma: no cover - exercised on machines without torch.
     raise SystemExit("PyTorch is required for training. Install it in a project/local environment.") from exc
 
-from model.hst_losses import ntp_loss, ordered_slot_loss, repeated_token_ce_loss, sparse_anchor_residual_loss
+from model.hst_losses import ntp_loss, ordered_slot_loss, repeated_token_ce_loss
 from model.hst_superposition import SuperpositionComposer, SuperpositionConfig
 from model.hst_token_types import build_token_type_cache
 
@@ -40,12 +40,7 @@ METHODS = {
     "boundary_aware_tst",
     "hierarchical_tst",
     "residual_structured_tst",
-    "paper_residual_structured_tst",
-    "adaptive_residual_tst",
-    "calibrated_paper_residual_tst",
     "conflict_adaptive_calibrated_tst",
-    "adaptive_calibrated_tst",
-    "sparse_anchor_residual_tst",
 }
 
 
@@ -93,13 +88,6 @@ class TrainConfig:
     hier_alpha: float = 0.1
     slot_gate_type: str = "embedding"
     type_vocab_size: int = 11
-    anchor_slot_idx: int = 0
-    residual_codebook_size: int = 256
-    sar_gate_threshold: float = 0.05
-    residual_loss_weight: float = 0.5
-    adaptive_min_superpose_size: int = 4
-    adaptive_hard_token_types: str = "3,9,10"
-    adaptive_hard_threshold: float = 0.0
     calibration_loss_weight: float = 0.0
     calibration_seq_len: int = 0
     calibration_interval: int = 1
@@ -108,11 +96,6 @@ class TrainConfig:
     calibration_loss_weight_max: float = 0.5
     calibration_ema_beta: float = 0.98
     calibration_ratio_eps: float = 1e-8
-    adaptive_recovery_switch: int = 0
-    adaptive_recovery_threshold: float = 0.66
-    adaptive_recovery_patience: int = 3
-    adaptive_recovery_min_superpose_steps: int = 30000
-    adaptive_recovery_max_superpose_steps: int = 0
     log_jsonl: str = "metrics.jsonl"
     use_wandb: int = 0
     wandb_project: str = "hst-minimind"
@@ -267,14 +250,6 @@ class CalibrationState:
         self.last_weight = None
         self.last_ratio_ema = None
 
-
-@dataclass
-class AdaptiveRecoveryState:
-    triggered_step: int | None = None
-    patience_count: int = 0
-    last_triggered: bool = False
-
-
 def load_texts(path: Path) -> list[str]:
     texts = []
     with path.open("r", encoding="utf-8") as f:
@@ -340,21 +315,6 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("hier_alpha must be non-negative")
     if cfg.use_swanlab:
         raise ValueError("swanlab integration is not implemented")
-    if cfg.anchor_slot_idx < 0 or cfg.anchor_slot_idx >= cfg.superpose_size:
-        raise ValueError("anchor_slot_idx must be in [0, superpose_size)")
-    if cfg.residual_codebook_size <= 0:
-        raise ValueError("residual_codebook_size must be positive")
-    if cfg.sar_gate_threshold < 0.0:
-        raise ValueError("sar_gate_threshold must be non-negative")
-    if cfg.residual_loss_weight < 0.0:
-        raise ValueError("residual_loss_weight must be non-negative")
-    if cfg.adaptive_min_superpose_size <= 0:
-        raise ValueError("adaptive_min_superpose_size must be positive")
-    if cfg.adaptive_min_superpose_size > cfg.superpose_size or cfg.superpose_size % cfg.adaptive_min_superpose_size != 0:
-        raise ValueError("adaptive_min_superpose_size must divide superpose_size")
-    parse_int_csv(cfg.adaptive_hard_token_types)
-    if not 0.0 <= cfg.adaptive_hard_threshold <= 1.0:
-        raise ValueError("adaptive_hard_threshold must be in [0, 1]")
     if cfg.calibration_loss_weight < 0.0:
         raise ValueError("calibration_loss_weight must be non-negative")
     if cfg.calibration_seq_len < 0:
@@ -369,23 +329,6 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("calibration_ema_beta must be in [0, 1)")
     if cfg.calibration_ratio_eps <= 0.0:
         raise ValueError("calibration_ratio_eps must be positive")
-    if cfg.adaptive_recovery_switch and cfg.method == "ntp_baseline":
-        raise ValueError("adaptive_recovery_switch requires a TST method")
-    if cfg.adaptive_recovery_switch and not uses_adaptive_calibration(cfg):
-        raise ValueError("adaptive_recovery_switch requires adaptive calibration")
-    if not 0.0 <= cfg.adaptive_recovery_threshold <= 10.0:
-        raise ValueError("adaptive_recovery_threshold must be in [0, 10]")
-    if cfg.adaptive_recovery_patience <= 0:
-        raise ValueError("adaptive_recovery_patience must be positive")
-    if cfg.adaptive_recovery_min_superpose_steps < 0:
-        raise ValueError("adaptive_recovery_min_superpose_steps must be non-negative")
-    if cfg.adaptive_recovery_max_superpose_steps < 0:
-        raise ValueError("adaptive_recovery_max_superpose_steps must be non-negative")
-    if (
-        cfg.adaptive_recovery_max_superpose_steps > 0
-        and cfg.adaptive_recovery_min_superpose_steps > cfg.adaptive_recovery_max_superpose_steps
-    ):
-        raise ValueError("adaptive_recovery_min_superpose_steps must be <= adaptive_recovery_max_superpose_steps")
     if cfg.lr_scheduler not in {"constant", "wsd"}:
         raise ValueError("lr_scheduler must be constant or wsd")
     if cfg.warmup_steps < 0:
@@ -400,22 +343,9 @@ def validate_config(cfg: TrainConfig) -> None:
         raise ValueError("min_learning_rate must be <= learning_rate")
 
 
-def parse_int_csv(value: str) -> list[int]:
-    try:
-        return [int(item) for item in value.split(",") if item.strip()]
-    except ValueError as exc:
-        raise ValueError(f"invalid integer CSV: {value}") from exc
-
-
-def is_adaptive_method(cfg: TrainConfig) -> bool:
-    return cfg.method in {"adaptive_residual_tst", "adaptive_calibrated_tst"}
-
-
 def uses_calibration(cfg: TrainConfig) -> bool:
     return cfg.calibration_loss_weight > 0.0 or cfg.method in {
-        "calibrated_paper_residual_tst",
         "conflict_adaptive_calibrated_tst",
-        "adaptive_calibrated_tst",
     }
 
 
@@ -435,51 +365,12 @@ def recovery_start_step(cfg: TrainConfig) -> int:
     return int(cfg.max_steps * tst_ratio(cfg))
 
 
-def adaptive_recovery_deadline(cfg: TrainConfig) -> int:
-    planned = recovery_start_step(cfg)
-    if not cfg.adaptive_recovery_max_superpose_steps:
-        return planned
-    return min(planned, cfg.adaptive_recovery_max_superpose_steps)
-
-
-def phase_for_step(cfg: TrainConfig, step: int, adaptive_recovery_start_step: int | None = None) -> str:
+def phase_for_step(cfg: TrainConfig, step: int) -> str:
     if cfg.phase_override:
         return cfg.phase_override
     if cfg.method == "ntp_baseline":
         return "ntp"
-    recovery_start = adaptive_recovery_start_step if adaptive_recovery_start_step is not None else recovery_start_step(cfg)
-    return "superposition" if step < recovery_start else "recovery"
-
-
-def maybe_update_adaptive_recovery(
-    cfg: TrainConfig,
-    state: AdaptiveRecoveryState,
-    calibration_state: CalibrationState,
-    step: int,
-    phase: str,
-) -> None:
-    state.last_triggered = False
-    if not cfg.adaptive_recovery_switch or state.triggered_step is not None or phase != "superposition":
-        return
-    local_step = step + 1
-    deadline = adaptive_recovery_deadline(cfg)
-    if local_step >= deadline:
-        state.triggered_step = deadline
-        state.last_triggered = True
-        return
-    ratio_ema = calibration_state.last_ratio_ema
-    if local_step < cfg.adaptive_recovery_min_superpose_steps:
-        state.patience_count = 0
-        return
-    if ratio_ema is None:
-        return
-    if ratio_ema <= cfg.adaptive_recovery_threshold:
-        state.patience_count += 1
-    else:
-        state.patience_count = 0
-    if state.patience_count >= cfg.adaptive_recovery_patience:
-        state.triggered_step = local_step
-        state.last_triggered = True
+    return "superposition" if step < recovery_start_step(cfg) else "recovery"
 
 
 def learning_rate_for_step(cfg: TrainConfig, step: int) -> float:
@@ -535,12 +426,7 @@ def method_to_mode(cfg: TrainConfig) -> str:
         "boundary_aware_tst": "boundary_aware",
         "hierarchical_tst": "hierarchical",
         "residual_structured_tst": "residual_structured",
-        "paper_residual_structured_tst": "residual_structured",
-        "calibrated_paper_residual_tst": "residual_structured",
         "conflict_adaptive_calibrated_tst": "residual_structured",
-        "adaptive_residual_tst": "adaptive_residual_structured",
-        "adaptive_calibrated_tst": "adaptive_residual_structured",
-        "sparse_anchor_residual_tst": "sparse_anchor_residual",
     }.get(cfg.method, cfg.superpose_mode)
 
 
@@ -557,9 +443,6 @@ def train_raw_seq_len(cfg: TrainConfig) -> int:
 
 
 def model_seq_len(cfg: TrainConfig) -> int:
-    if is_adaptive_method(cfg):
-        adaptive_raw_len = baseline_seq_len(cfg) * cfg.superpose_size
-        return max(baseline_seq_len(cfg), adaptive_raw_len // cfg.adaptive_min_superpose_size)
     return baseline_seq_len(cfg)
 
 
@@ -636,17 +519,6 @@ def compute_loss(
         raise ValueError("superposition phase requires a composer")
     composed = composer.compose(batch)
     out = model(inputs_embeds=composed["inputs_embeds"])
-    if cfg.loss_mode == "sparse_anchor_residual":
-        return sparse_anchor_residual_loss(
-            out["logits"],
-            out["hidden_states"],
-            composed["anchor_targets"],
-            composed["residual_code_targets"],
-            composer.residual_head,
-            cfg.residual_codebook_size,
-            composed["residual_gate_mask"],
-            cfg.residual_loss_weight,
-        )
     if cfg.loss_mode == "ordered_slot":
         loss = ordered_slot_loss(out["hidden_states"], composed["chunk_targets"], model.lm_head, composer.slot_embed)
     else:
@@ -745,18 +617,12 @@ def init_wandb(cfg: TrainConfig, output_dir: Path):
             "tst_ratio": tst_ratio(cfg),
             "baseline_seq_len": baseline_seq_len(cfg),
             "paper_equal_flops": cfg.paper_equal_flops,
-            "adaptive_min_superpose_size": cfg.adaptive_min_superpose_size,
             "calibration_loss_weight": cfg.calibration_loss_weight,
             "calibration_adaptive": cfg.calibration_adaptive or int(cfg.method == "conflict_adaptive_calibrated_tst"),
             "calibration_loss_weight_min": cfg.calibration_loss_weight_min,
             "calibration_loss_weight_max": cfg.calibration_loss_weight_max,
             "calibration_ema_beta": cfg.calibration_ema_beta,
             "calibration_seq_len": cfg.calibration_seq_len,
-            "adaptive_recovery_switch": cfg.adaptive_recovery_switch,
-            "adaptive_recovery_threshold": cfg.adaptive_recovery_threshold,
-            "adaptive_recovery_patience": cfg.adaptive_recovery_patience,
-            "adaptive_recovery_min_superpose_steps": cfg.adaptive_recovery_min_superpose_steps,
-            "adaptive_recovery_max_superpose_steps": cfg.adaptive_recovery_max_superpose_steps,
         }
     )
     return run
@@ -772,14 +638,9 @@ def build_wandb_record(record: dict) -> dict:
         "raw_tokens_seen",
         "effective_data_tokens_seen",
         "gpu_mem_gb",
-        "adaptive_hard_window_rate",
-        "adaptive_effective_superpose_size",
         "calibration_loss",
         "calibration_loss_weight_effective",
         "calibration_loss_ratio_ema",
-        "adaptive_recovery_triggered",
-        "adaptive_recovery_start_step",
-        "adaptive_recovery_patience_count",
     )
     return {key: record[key] for key in keys if record.get(key) is not None}
 
@@ -833,12 +694,6 @@ def main() -> None:
             chunks_per_block=cfg.chunks_per_block,
             order_alpha=cfg.order_alpha,
             hier_alpha=cfg.hier_alpha,
-            anchor_slot_idx=cfg.anchor_slot_idx,
-            residual_codebook_size=cfg.residual_codebook_size,
-            sar_gate_threshold=cfg.sar_gate_threshold,
-            adaptive_min_superpose_size=cfg.adaptive_min_superpose_size,
-            adaptive_hard_token_types=cfg.adaptive_hard_token_types,
-            adaptive_hard_threshold=cfg.adaptive_hard_threshold,
         )
         composer = SuperpositionComposer(model.token_embedding, cfg.hidden_size, vocab_size, sp_cfg, token_types).to(device)
     model_param_ids = {id(p) for p in model.parameters()}
@@ -854,7 +709,6 @@ def main() -> None:
     latent_tokens_seen = start_step * cfg.batch_size * baseline_seq_len(cfg)
     effective_data_tokens_seen = raw_tokens_seen
     calibration_state = CalibrationState()
-    adaptive_recovery_state = AdaptiveRecoveryState()
 
     print(yaml.safe_dump(asdict(cfg), sort_keys=True))
     for step in range(start_step, cfg.max_steps):
@@ -864,7 +718,7 @@ def main() -> None:
             data_iter = iter(loader)
             batch = next(data_iter)
         global_step = cfg.global_step_offset + step + 1
-        phase = phase_for_step(cfg, step, adaptive_recovery_state.triggered_step)
+        phase = phase_for_step(cfg, step)
         batch = batch_for_phase(batch.to(device), cfg, phase)
         set_optimizer_lr(optimizer, learning_rate_for_step(cfg, step))
         optimizer.zero_grad(set_to_none=True)
@@ -876,7 +730,6 @@ def main() -> None:
             raise RuntimeError(f"non-finite loss at step {step}: {loss.item()}")
         loss.backward()
         optimizer.step()
-        maybe_update_adaptive_recovery(cfg, adaptive_recovery_state, calibration_state, step, phase)
 
         loss_eval_ntp = None
         loss_eval_phase = None
@@ -917,11 +770,6 @@ def main() -> None:
             "baseline_seq_len": baseline_seq_len(cfg),
             "raw_seq_len": batch.size(1),
             "paper_equal_flops": cfg.paper_equal_flops,
-            "adaptive_recovery_switch": cfg.adaptive_recovery_switch,
-            "adaptive_recovery_threshold": cfg.adaptive_recovery_threshold,
-            "adaptive_recovery_start_step": adaptive_recovery_state.triggered_step,
-            "adaptive_recovery_patience_count": adaptive_recovery_state.patience_count,
-            "adaptive_recovery_triggered": adaptive_recovery_state.last_triggered,
             "wall_time_sec": time.time() - start_time,
             "gpu_mem_gb": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else 0.0,
         }
@@ -929,9 +777,6 @@ def main() -> None:
             record["calibration_loss"] = calibration_state.last_loss
             record["calibration_loss_weight_effective"] = calibration_state.last_weight
             record["calibration_loss_ratio_ema"] = calibration_state.last_ratio_ema
-        for key in ("adaptive_hard_window_rate", "adaptive_effective_superpose_size"):
-            if key in train_composer_metadata:
-                record[key] = train_composer_metadata[key]
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         if wandb_run is not None:

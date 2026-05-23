@@ -35,17 +35,6 @@ class SuperpositionShapeTest(unittest.TestCase):
     def test_residual_structured_shapes(self):
         self._run_mode("residual_structured", 4)
 
-    def test_sparse_anchor_residual_shapes(self):
-        embed = nn.Embedding(64, 16)
-        cfg = SuperpositionConfig(mode="sparse_anchor_residual", superpose_size=4, hidden_size=16, vocab_size=64)
-        composer = SuperpositionComposer(embed, 16, 64, cfg)
-        batch = torch.randint(0, 64, (3, 17))
-        out = composer.compose(batch)
-        self.assertEqual(out["inputs_embeds"].shape, (3, 3, 16))
-        self.assertEqual(out["anchor_targets"].shape, (3, 3))
-        self.assertEqual(out["residual_code_targets"].shape, (3, 3, 3))
-        self.assertEqual(out["residual_gate_mask"].shape, (3, 3))
-
     def test_order_aware_distinguishes_reversed_chunk(self):
         embed = nn.Embedding(16, 4)
         with torch.no_grad():
@@ -164,51 +153,6 @@ class SuperpositionShapeTest(unittest.TestCase):
         mean_z = SuperpositionComposer(embed, 8, 64, mean_cfg).compose(batch)["inputs_embeds"]
         residual_z = SuperpositionComposer(embed, 8, 64, residual_cfg).compose(batch)["inputs_embeds"]
         self.assertTrue(torch.allclose(mean_z[:, 0], residual_z[:, 0]))
-
-    def test_sparse_anchor_residual_high_threshold_matches_mean(self):
-        embed = nn.Embedding(64, 8)
-        batch = torch.randint(0, 64, (2, 16))
-        mean_cfg = SuperpositionConfig(mode="mean", superpose_size=4, hidden_size=8, vocab_size=64)
-        sar_cfg = SuperpositionConfig(
-            mode="sparse_anchor_residual",
-            superpose_size=4,
-            hidden_size=8,
-            vocab_size=64,
-            order_alpha=0.1,
-            hier_alpha=0.1,
-            sar_gate_threshold=1e6,
-        )
-        mean_z = SuperpositionComposer(embed, 8, 64, mean_cfg).compose(batch)["inputs_embeds"]
-        sar_z = SuperpositionComposer(embed, 8, 64, sar_cfg).compose(batch)["inputs_embeds"]
-        self.assertTrue(torch.allclose(mean_z, sar_z))
-
-    def test_adaptive_residual_packs_easy_windows_and_splits_hard_windows(self):
-        embed = nn.Embedding(64, 8)
-        token_types = torch.zeros(64, dtype=torch.long)
-        token_types[9] = 3
-        cfg = SuperpositionConfig(
-            mode="adaptive_residual_structured",
-            superpose_size=8,
-            adaptive_min_superpose_size=4,
-            hidden_size=8,
-            vocab_size=64,
-            order_alpha=0.0,
-            hier_alpha=0.0,
-            adaptive_hard_token_types="3",
-        )
-        composer = SuperpositionComposer(embed, 8, 64, cfg, token_types)
-        batch = torch.tensor(
-            [
-                [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18],
-                [1, 2, 3, 4, 9, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18],
-            ]
-        )
-        out = composer.compose(batch)
-        self.assertEqual(out["inputs_embeds"].shape, (2, 2, 8))
-        self.assertEqual(out["chunk_targets"].shape, (2, 2, 8))
-        self.assertEqual(out["chunk_target_mask"].sum().item(), 20)
-        self.assertAlmostEqual(out["metadata"]["adaptive_hard_window_rate"], 0.25)
-
 
 if __name__ == "__main__":
     unittest.main()

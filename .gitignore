@@ -2,6 +2,7 @@ hst_git/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
@@ -10,6 +11,7 @@ env/
 
 hst_runs/
 hst_logs/
+wandb/
 # hst_outputs/
 hst_checkpoints/
 hst_outputs/*.jsonl
@@ -29,3 +31,6 @@ tokenizer/
 *.bin
 *.safetensors
 .vendor/
+
+PRD.md
+proxy.txt
