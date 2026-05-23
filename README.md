@@ -2,7 +2,7 @@
 
 This repository is a compact research prototype for faster language-model pretraining with Token Superposition Training (TST).
 
-The main experiment is **CACT** (Conflict-Aware Calibrated TST): a lightweight residual TST variant that keeps the paper-style repeated-token cross entropy objective, then adds a small online calibration loss during the superposition phase. The goal is not to change inference. The goal is to make TST reach the same NTP quality in fewer training steps.
+The main experiment is **CACT** (Conflict-Aware Calibrated TST): a lightweight residual TST variant that keeps the paper-style repeated-token cross entropy objective, then adds a small online calibration loss during the superposition phase. The goal is to make TST reach the same NTP quality in fewer training steps.
 
 ## Key Result
 
